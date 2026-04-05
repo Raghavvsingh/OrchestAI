@@ -718,19 +718,19 @@ Default to "existing_company" for capitalized proper nouns unless clear startup 
                     {
                         "id": "T3",
                         "task": f"Evaluate {entity_name}'s financial performance, growth metrics, profitability, and operational efficiency compared to industry benchmarks",
-                        "depends_on": ["T1", "T2"],
+                        "depends_on": ["T1"],
                         "reason": "Performance assessment and competitive standing"
                     },
                     {
                         "id": "T4",
                         "task": f"Analyze {entity_name}'s strategic initiatives, market opportunities, challenges, and industry trends affecting {domain}",
-                        "depends_on": ["T2"],
+                        "depends_on": ["T1"],
                         "reason": "Strategic context and future outlook"
                     },
                     {
                         "id": "T5",
                         "task": f"Provide comprehensive assessment of {entity_name}'s strengths, weaknesses, competitive threats, growth potential, and strategic recommendations",
-                        "depends_on": ["T3", "T4"],
+                        "depends_on": ["T1", "T2", "T3", "T4"],
                         "reason": "Strategic insights and actionable recommendations"
                     },
                 ]
@@ -751,21 +751,21 @@ Default to "existing_company" for capitalized proper nouns unless clear startup 
                     },
                     {
                         "id": "T3",
-                        "task": f"Evaluate {entity_name}'s strengths, weaknesses, and competitive advantages relative to alternatives",
-                        "depends_on": ["T2"],
-                        "reason": "Strategic position assessment"
+                        "task": f"Evaluate market size, growth trends, and demand for {entity_name}'s category in {domain}",
+                        "depends_on": ["T1"],
+                        "reason": "Market opportunity assessment"
                     },
                     {
                         "id": "T4",
-                        "task": f"Analyze market dynamics, trends, and growth opportunities relevant to {entity_name}",
+                        "task": f"Assess {entity_name}'s differentiation, risks, barriers to entry, and go-to-market challenges",
                         "depends_on": ["T1"],
-                        "reason": "Market context and opportunities"
+                        "reason": "Strategic viability analysis"
                     },
                     {
                         "id": "T5",
-                        "task": f"Provide strategic assessment of {entity_name} with recommendations and key considerations",
-                        "depends_on": ["T3", "T4"],
-                        "reason": "Actionable insights and recommendations"
+                        "task": f"Synthesize findings to recommend whether {entity_name} is viable, key success factors, and strategic priorities",
+                        "depends_on": ["T1", "T2", "T3", "T4"],
+                        "reason": "Final strategic recommendation"
                     },
                 ]
         

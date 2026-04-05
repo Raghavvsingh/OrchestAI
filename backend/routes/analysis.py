@@ -494,11 +494,21 @@ async def get_result(run_id: str):
                     error=t.error,
                 ))
             
+            # Parse final_report if it's a JSON string (database stores as string)
+            final_report_data = run.final_report
+            if isinstance(final_report_data, str):
+                import json
+                try:
+                    final_report_data = json.loads(final_report_data)
+                except Exception as e:
+                    logger.warning(f"Failed to parse final_report JSON: {e}")
+                    final_report_data = {}
+            
             return RunResultResponse(
                 run_id=run_id,
                 goal=run.goal or "",
                 status=run.status or "pending",
-                final_report=run.final_report,
+                final_report=final_report_data,
                 tasks=task_responses,
                 total_cost={
                     "prompt_tokens": cost.prompt_tokens if cost else 0,
