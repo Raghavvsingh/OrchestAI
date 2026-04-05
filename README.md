@@ -166,7 +166,3 @@ Final reports include:
 - API keys are stored in `.env` (not committed)
 - Database uses SSL connection
 - CORS configured for local development
-
-## 📝 License
-
-MIT
