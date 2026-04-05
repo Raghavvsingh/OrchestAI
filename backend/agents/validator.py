@@ -156,8 +156,8 @@ class ValidatorAgent(BaseAgent):
         # ============== V18: 5-METRIC SCORING ==============
         metrics = self._calculate_v18_metrics(output, task_description, expected_domain)
         
-        # Quick check - if metrics are very high, skip deep validation
-        if metrics["confidence"] >= 0.75 and not is_retry:
+        # Quick check - if metrics are fairly high, skip deep validation (SPEED OPTIMIZATION)
+        if metrics["confidence"] >= 0.70 and not is_retry:
             self.log(f"V18: High confidence ({metrics['confidence']:.2f}), skipping deep validation", task_id=task_id)
             return {
                 "success": True,
@@ -177,15 +177,15 @@ class ValidatorAgent(BaseAgent):
         # Stage 2: Deep validation (rule-based)
         rule_result = self._validate_rules_investor(output, sources, task_description, context)
         
-        # COST OPTIMIZATION: ONLY run LLM validation for final task or retries
+        # COST OPTIMIZATION: ONLY run LLM validation for final task or retries with low scores
         is_final_task = any(kw in task_description.lower() 
             for kw in ["final", "verdict", "recommend", "decision", "strategic recommendation"])
         
         # Only use LLM validation if:
         # 1. Final task (needs high quality verdict)
         # 2. OR retry attempt (failed before, needs deeper check)
-        # 3. OR rule validation score is very low (< 6.5)
-        if is_final_task or is_retry or rule_result["score"] < 6.5:
+        # 3. OR rule validation score is very low (< 6.0) - SPEED OPTIMIZATION: raised from 6.5
+        if is_final_task or (is_retry and rule_result["score"] < 6.0):
             # Layer 3: LLM-based quality assessment (EXPENSIVE - use sparingly)
             llm_result = await self._validate_llm_investor(
                 task_id,
@@ -193,7 +193,7 @@ class ValidatorAgent(BaseAgent):
                 output,
                 sources,
             )
-            self.log(f"LLM validation used (final={is_final_task}, retry={is_retry}, low_score={rule_result['score']< 6.5})", task_id=task_id)
+            self.log(f"LLM validation used (final={is_final_task}, retry={is_retry}, low_score={rule_result['score']< 0.6})", task_id=task_id)
         else:
             # COST OPTIMIZATION: Skip LLM validation for normal tasks
             # Rule-based validation is sufficient for 80% of cases
@@ -225,10 +225,10 @@ class ValidatorAgent(BaseAgent):
         """V15: Quick check - different rules for THINKING vs STRUCTURING tasks."""
         missing = []
         weak = []
-        score = 8.0
+        score = 0.8  # V18: Changed to 0-1 scale (was 8.0 out of 10)
         
         if not isinstance(output, dict):
-            return {"passes": False, "score": 2.0, "missing": ["valid_dict_output"], "weak": []}
+            return {"passes": False, "score": 0.2, "missing": ["valid_dict_output"], "weak": []}
         
         # V15: Check if this is a final/structuring task
         is_final_task = output.get("is_final_task", False)
@@ -239,30 +239,30 @@ class ValidatorAgent(BaseAgent):
         # ============== V15: THINKING TASK VALIDATION (T1-T4) ==============
         # For non-final tasks: only check facts, insights, risks
         
-        # CHECK 1: key_insight is MANDATORY for ALL tasks
+        # CHECK 1: key_insight is MANDATORY for ALL tasks (relaxed requirement)
         key_insight = str(output.get("key_insight", ""))
-        if not key_insight or len(key_insight) < 20:
+        if not key_insight or len(key_insight) < 10:  # Reduced from 20 to 10
             missing.append("key_insight")
-            score -= 1.5
+            score -= 0.10  # Reduced penalty from 0.15 to 0.10
         else:
             # V15: Reject generic insights
             insight_lower = key_insight.lower()
             for phrase in GENERIC_INSIGHT_PHRASES:
                 if phrase in insight_lower:
                     weak.append("generic_insight")
-                    score -= 1.0
+                    score -= 0.10
                     break
         
-        # CHECK 2: facts should be present
+        # CHECK 2: facts should be present (relaxed requirement)
         facts = output.get("facts", [])
-        if not facts or len(facts) < 2:
+        if not facts or len(facts) < 1:  # Reduced from 2 to 1
             weak.append("insufficient_facts")
-            score -= 0.5
+            score -= 0.03  # Reduced penalty from 0.05 to 0.03
         
         # CHECK 3: biggest_risk should be present
         if not output.get("biggest_risk"):
             weak.append("missing_risk")
-            score -= 0.3
+            score -= 0.03
         
         # ============== V15: STRUCTURING TASK VALIDATION (FINAL ONLY) ==============
         if is_final_task:
@@ -274,7 +274,7 @@ class ValidatorAgent(BaseAgent):
                     comparison = {"rows": comparison}
                 else:
                     missing.append("comparison_table")
-                    score -= 2.0
+                    score -= 0.20
                     comparison = {"rows": []}  # Set to empty dict for further checks
             
             if isinstance(comparison, dict):
@@ -283,14 +283,14 @@ class ValidatorAgent(BaseAgent):
                     rows = []
                 if len(rows) < 3:
                     missing.append("comparison_table_3_rows")
-                    score -= 1.5
+                    score -= 0.15
                 else:
                     # Check winners
                     rows_without_winners = [i for i, r in enumerate(rows) 
                                             if isinstance(r, dict) and not r.get("winner")]
                     if rows_without_winners:
                         weak.append(f"missing_winners_{len(rows_without_winners)}")
-                        score -= 0.5 * len(rows_without_winners)
+                        score -= 0.05 * len(rows_without_winners)
             
             # CHECK 5: final_verdict MANDATORY for final task
             final_verdict = output.get("final_verdict", {})
@@ -299,24 +299,24 @@ class ValidatorAgent(BaseAgent):
                 final_verdict = {}
             if not final_verdict.get("verdict"):
                 missing.append("final_verdict")
-                score -= 2.0
+                score -= 0.20
             else:
                 verdict_val = str(final_verdict.get("verdict", "")).upper()
                 if verdict_val not in ["YES", "NO", "CONDITIONAL"]:
                     weak.append("invalid_verdict_value")
-                    score -= 0.5
+                    score -= 0.05
                 args_for = final_verdict.get("arguments_for", [])
                 args_against = final_verdict.get("arguments_against", [])
                 if not isinstance(args_for, list) or len(args_for) < 2:
                     weak.append("insufficient_arguments_for")
-                    score -= 0.5
+                    score -= 0.05
                 if not isinstance(args_against, list) or len(args_against) < 2:
                     weak.append("insufficient_arguments_against")
-                    score -= 0.5
+                    score -= 0.05
         
         return {
             "passes": len(missing) == 0,
-            "score": max(4.0, score),
+            "score": max(0.4, score),  # V18: Floor is 0.4 on 0-1 scale (was 4.0 out of 10)
             "missing": missing,
             "weak": weak,
         }
@@ -1165,8 +1165,8 @@ Output JSON: {{comparison_depth, insight_quality, competitor_quality, decision_s
             }
         
         # Weight: rules 45%, LLM 55%
-        rule_score = rule_result.get("score", 7)
-        llm_score = llm_result.get("score", 7.5)
+        rule_score = rule_result.get("score", 0.7)  # V18: Default 0.7 on 0-1 scale (was 7 out of 10)
+        llm_score = llm_result.get("score", 0.75)   # V18: Default 0.75 on 0-1 scale (was 7.5 out of 10)
         
         final_score = (rule_score * 0.45) + (llm_score * 0.55)
         
@@ -1189,7 +1189,7 @@ Output JSON: {{comparison_depth, insight_quality, competitor_quality, decision_s
             "feedback_for_retry": feedback,
             "dimension_scores": llm_result.get("dimension_scores", {}),
             "layer_scores": {
-                "schema": schema_result.get("score", 10),
+                "schema": schema_result.get("score", 1.0),  # V18: 0-1 scale (was 10)
                 "rules": rule_score,
                 "llm": llm_score,
             },

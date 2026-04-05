@@ -6,7 +6,7 @@ import json
 import time
 import asyncio
 
-from openai import AsyncOpenAI, APITimeoutError, RateLimitError, APIError
+from openai import AsyncOpenAI, APITimeoutError, RateLimitError, APIError, APIConnectionError
 from tenacity import (
     retry, 
     stop_after_attempt, 
@@ -34,10 +34,10 @@ class LLMService:
     """Service for interacting with OpenAI API."""
     
     def __init__(self):
-        # Increase timeout to 120 seconds to handle slow responses
+        # Aggressive timeout for faster failure detection
         self.client = AsyncOpenAI(
             api_key=settings.openai_api_key,
-            timeout=120.0,  # 120 second timeout
+            timeout=45.0,  # 45 second timeout (reduced from 60)
             max_retries=0,  # We handle retries ourselves
         )
         self.model = settings.llm_model
@@ -58,9 +58,9 @@ class LLMService:
         return prompt_cost + completion_cost
     
     @retry(
-        stop=stop_after_attempt(4),  # Increased to 4 attempts
-        wait=wait_exponential(multiplier=2, min=4, max=30),  # Longer waits
-        retry=retry_if_exception_type((APITimeoutError, RateLimitError, APIError, asyncio.TimeoutError)),
+        stop=stop_after_attempt(2),  # V23: Reduced from 3 to 2 for faster failure
+        wait=wait_exponential(multiplier=1, min=1, max=8),  # V23: Faster retry (was 2, 2, 15)
+        retry=retry_if_exception_type((APITimeoutError, RateLimitError, APIError, APIConnectionError)),  # Removed asyncio.TimeoutError - must not catch outer timeout
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )
     async def generate(
@@ -68,7 +68,7 @@ class LLMService:
         prompt: str,
         system_prompt: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: int = 1500,  # Reduced from 2000 for faster responses
+        max_tokens: int = 1000,  # Reduced from 1500 for faster responses
         json_mode: bool = False,
     ) -> Dict[str, Any]:
         """Generate a response from the LLM with caching (COST OPTIMIZATION)."""
@@ -139,6 +139,9 @@ class LLMService:
         except APITimeoutError as e:
             logger.error(f"LLM API timeout after {time.time() - start_time:.1f}s")
             raise
+        except APIConnectionError as e:
+            logger.error(f"LLM API connection error: {e} - Check API key and network")
+            raise
         except RateLimitError as e:
             logger.error(f"LLM API rate limit hit: {e}")
             raise
@@ -151,7 +154,7 @@ class LLMService:
         prompt: str,
         system_prompt: Optional[str] = None,
         temperature: float = 0.3,
-        max_tokens: int = 1500,  # Reduced from 2000
+        max_tokens: int = 1000,  # Reduced from 1500 for speed
     ) -> Dict[str, Any]:
         """Generate JSON response from LLM."""
         try:

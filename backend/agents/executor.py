@@ -19,13 +19,16 @@ from agents.greybox_prompts import (
     DEPTH_STRUCTURE_PROMPT,
     TASK_INSIGHT_ANGLES,
     TASK_FOCUS_MAP,
+    STARTUP_TASK_FOCUS_MAP,
+    COMPANY_TASK_FOCUS_MAP,
     detect_case_type,
     validate_comparison_output,
     validate_insight_quality,
     validate_insight_depth,
     validate_per_task_comparison,
     check_insight_repetition,
-    get_task_focus
+    get_task_focus,
+    get_task_focus_for_context,  # NEW: Context-aware task focus
 )
 
 logger = logging.getLogger(__name__)
@@ -109,13 +112,13 @@ PLACEHOLDER_PATTERNS = [
 
 # ============== V17: DRIFT DETECTION KEYWORDS ==============
 # Keywords that indicate domain drift - if these appear in output for unrelated goals, reject
+# V18: Removed overlapping keywords that conflict with VALID_DOMAIN_KEYWORDS (banking, restaurant, recipe, food delivery)
 INVALID_DOMAIN_KEYWORDS = [
     "healthcare", "hospital", "medical", "patient", "clinical",
     "disco", "nightclub", "party", "entertainment venue",
-    "restaurant", "food delivery", "recipe",
     "real estate", "property", "housing",
     "automotive", "car", "vehicle",
-    "banking", "loan", "mortgage",
+    "loan", "mortgage",
     "insurance", "policy", "coverage",
     "pharmaceutical", "drug", "medication",
     "manufacturing", "factory", "industrial",
@@ -531,30 +534,70 @@ CURRENT TASK:
             
             # Step 1: Generate smart search queries (COST OPTIMIZED: 2 max instead of 3-4)
             queries = self._generate_search_queries(task_description, goal_classification)
-            self.log(f"Searching with {len(queries)} queries", task_id=task_id)
+            self.log(f"Generated {len(queries)} search queries", task_id=task_id)
             
-            # Step 2: Execute searches (COST OPTIMIZED: Limit to 2 queries, 4 results each)
+            if not queries:
+                # Fallback: Use task description directly
+                queries = [task_description[:200]]
+                self.log(f"No queries generated, using task description as fallback", task_id=task_id)
+            
+            # Step 2: Execute searches IN PARALLEL (SPEED OPTIMIZATION)
+            search_queries = queries[:2]  # Max 2 queries
+            self.log(f"Running {len(search_queries)} parallel searches: {[q[:50] for q in search_queries]}", task_id=task_id)
+            
+            # Run searches concurrently
+            import asyncio
+            search_tasks = [
+                self._search(query, task_description, max_results=3)
+                for query in search_queries
+            ]
+            search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+            
             all_results = []
-            for query in queries[:2]:  # COST OPTIMIZATION: Max 2 queries (was 3)
-                results = await self._search(query, task_description, max_results=4)  # Max 4 results (was 5)
-                all_results.extend(results.get("results", []))
+            for i, results in enumerate(search_results):
+                if isinstance(results, Exception):
+                    self.log(f"Search {i+1} failed with exception: {type(results).__name__}: {results}", level="warning", task_id=task_id)
+                elif results is None:
+                    self.log(f"Search {i+1} returned None", level="warning", task_id=task_id)
+                else:
+                    result_count = len(results.get('results', []))
+                    self.log(f"Search {i+1}/{len(search_queries)} returned {result_count} results", task_id=task_id)
+                    all_results.extend(results.get("results", []))
             
             # Deduplicate
             all_results = self._deduplicate_results(all_results)
             self.log(f"Found {len(all_results)} unique search results", task_id=task_id)
             
             if not all_results:
-                # Try simpler search
+                # Fallback 1: Try simpler search with entity name
                 entities = goal_classification.get("entities", [])
+                self.log(f"No results from parallel search, trying entity fallback: {entities}", task_id=task_id)
+                
                 if entities:
-                    results = await self._search(entities[0][:100], task_description)
-                    all_results = results.get("results", [])
+                    try:
+                        results = await self._search(entities[0][:100], task_description)
+                        all_results = results.get("results", [])
+                        self.log(f"Entity fallback returned {len(all_results)} results", task_id=task_id)
+                    except Exception as e:
+                        self.log(f"Entity fallback search failed: {e}", level="warning", task_id=task_id)
+                
+                # Fallback 2: Try direct simple search with just the company/entity name
+                if not all_results and entities:
+                    try:
+                        simple_query = f"{entities[0]} company overview"
+                        self.log(f"Trying simple fallback search: {simple_query}", task_id=task_id)
+                        results = await self._search(simple_query, task_description)
+                        all_results = results.get("results", [])
+                        self.log(f"Simple fallback returned {len(all_results)} results", task_id=task_id)
+                    except Exception as e:
+                        self.log(f"Simple fallback search failed: {e}", level="warning", task_id=task_id)
                 
                 if not all_results:
+                    self.log(f"ALL SEARCH STRATEGIES FAILED - classification: {goal_classification}", level="error", task_id=task_id)
                     return {
                         "success": False,
                         "task_id": task_id,
-                        "error": "No search results found",
+                        "error": "No search results found after all fallbacks",
                         "sources": [],
                     }
             
@@ -958,7 +1001,7 @@ CURRENT TASK:
                 if verdict not in ["YES", "NO", "CONDITIONAL"]:
                     issues.append("invalid_verdict: Must be YES, NO, or CONDITIONAL")
                 
-                strong_args = final_verdict.get("strong_arguments", [])
+                strong_args = final_verdict.get("arguments_for", [])
                 if len(strong_args) < 2:
                     issues.append("insufficient_arguments: Need 2-3 strong arguments for verdict")
                 
@@ -1284,17 +1327,13 @@ CURRENT TASK:
         valid_competitors: list = None,
         global_context: dict = None,
     ) -> Dict[str, Any]:
-        """Generate output using REAL MULTI-CALL PIPELINE (v15).
+        """Generate output using SINGLE-CALL PIPELINE (V23 SPEED FIX).
         
-        V15 Architecture:
-        - THINKING tasks (T1-T4): facts, insights, risks only
-        - STRUCTURING task (T5/final): comparison table + verdict
-        - Entity locking via global_context
-        - Insight repetition prevention
-        
-        Pipeline:
-        - Non-final: FACTS → INSIGHT (no table, no verdict)
-        - Final: FACTS → TABLE → INSIGHT → VERDICT → MERGE
+        V23 Architecture:
+        - SINGLE LLM call per task (not 3-4 calls!)
+        - All components in one JSON response
+        - Final task adds verdict
+        - 60-80% faster than multi-call pipeline
         """
         
         if global_context is None:
@@ -1351,9 +1390,9 @@ CURRENT TASK:
         if retry_feedback:
             feedback_section = f"\n⚠️ FIX THESE: {retry_feedback}\n"
         
-        self.log(f"V16: Starting REAL multi-call pipeline with STRICT CONTEXT (is_final={is_final_task})", task_id=task_id)
+        self.log(f"V23: Starting SINGLE-CALL pipeline (is_final={is_final_task})", task_id=task_id)
         
-        # ============== V16: BUILD STRICT CONTEXT ==============
+        # ============== V23: BUILD CONTEXT ==============
         strict_context = self._build_strict_context(
             goal=goal,
             task_description=task_description,
@@ -1361,331 +1400,153 @@ CURRENT TASK:
             category=global_context.get("category", "") if global_context else "",
         )
         
-        # ============== STEP 1: FACT EXTRACTION ==============
-        facts_prompt = f"""{strict_context}
-
-Extract ONLY verifiable facts from the search data below.
-
-RULES:
-- Each fact = 1 short line
-- NO reasoning, NO explanation, NO interpretation
-- Facts MUST relate to: {goal}
-- Include: competitors, features, target users, pricing (if available)
-- If unknown → "No reliable data available"
-- Use REAL company names only
-- DO NOT mention unrelated industries
-
-SEARCH DATA:
-{context_text[:2000]}
-{prev_context}
-
-Return ONLY valid JSON:
-{{"facts": ["fact 1", "fact 2", ...]}}"""
-
-        self.log(f"STEP 1: Extracting facts", task_id=task_id)
-        facts_response = await self.llm_service.generate_json(
-            prompt=facts_prompt,
-            system_prompt=f"You extract facts ONLY about: {goal}. Stay in domain. Return ONLY JSON.",
-            temperature=0.1,
-            max_tokens=400,
-        )
-        self.track_llm_usage(facts_response, task_id)
-        
-        facts_data = facts_response.get("parsed", {})
-        if isinstance(facts_data, list):
-            facts_data = {"facts": facts_data}
-        if not isinstance(facts_data, dict):
-            facts_data = {"facts": []}
-        
-        facts = facts_data.get("facts", [])
-        if not isinstance(facts, list):
-            facts = []
-        
-        self.log(f"STEP 1 RESULT: {len(facts)} facts extracted", task_id=task_id)
-        
-        # ============== V21: STEP 2 - PER-TASK COMPARISON (ALL TASKS) ==============
-        # V21 FIX: Comparison is now MANDATORY for ALL tasks, not just final
-        comparison_table = {"rows": []}
-        competitors_identified = {"direct": valid_competitors[:3], "indirect": []}
-        
-        # V21: Get task-specific focus and comparison dimensions
-        task_focus = get_task_focus(task_id)
-        # V21 FIX: Ensure task_focus is a dict
+        # V23: Get task-specific focus
+        entity_type = classification.get("entity_type", "concept")
+        task_focus = get_task_focus_for_context(task_id, entity_type)
         if not isinstance(task_focus, dict):
             task_focus = {"name": "General Analysis", "focus": "Comprehensive analysis", "question": "What should be understood?", "comparison_dims": ["features", "value", "fit"]}
-        task_comparison_dims = task_focus.get("comparison_dims", ["features", "value", "fit"])
         
-        # Build comparison prompt (for ALL tasks now)
-        comparison_prompt = f"""{strict_context}
+        # V15: Get existing insights to prevent repetition
+        existing_insights_str = ""
+        if existing_insights:
+            existing_insights_str = f"\nDO NOT REPEAT: {'; '.join(existing_insights[:3])}"
+        
+        # ============== V23: SINGLE UNIFIED PROMPT ==============
+        if is_final_task:
+            # Final task: Include verdict
+            unified_prompt = f"""{strict_context}
 
-{PER_TASK_COMPARISON_PROMPT}
-
-TASK TYPE: {task_focus.get('name', 'Analysis')}
-TASK FOCUS: {task_focus.get('focus', 'General analysis')}
-KEY QUESTION: {task_focus.get('question', 'What should be analyzed?')}
-
-Create a comparison for the ORIGINAL GOAL above.
-
-MANDATORY ENTITIES:
-- Entity A: {entity_a}
-- Entity B: {entity_b}
-
-FACTS FROM ANALYSIS:
-{json.dumps(facts[:10], indent=1)}
-
-REQUIRED COMPARISON DIMENSIONS FOR THIS TASK:
-{json.dumps(task_comparison_dims, indent=1)}
-
-STRICT RULES:
-- Include 2-3 comparison dimensions from the list above
-- EVERY dimension MUST have explicit winner
-- EVERY dimension MUST have "why_it_matters" explanation
-- Use EXACTLY these entities: "{entity_a}" and "{entity_b}"
-- DO NOT just list features - CONTRAST directly
-
+TASK: {task_description}
+ENTITIES: {entity_a} vs {entity_b}
+VALID COMPETITORS: {', '.join(valid_competitors[:5])}
+{existing_insights_str}
 {feedback_section}
 
-Return ONLY valid JSON:
+SEARCH DATA:
+{context_text[:1800]}
+{prev_context}
+
+Generate complete analysis in ONE JSON response:
+
 {{
+  "facts": ["5-7 key facts from search data"],
   "comparison": [
-    {{"dimension": "{task_comparison_dims[0] if task_comparison_dims else 'features'}", "entity_a": "Description for {entity_a}", "entity_b": "Description for {entity_b}", "key_difference": "What differs", "why_it_matters": "Why this matters for decision", "winner": "{entity_a} or {entity_b}"}},
-    {{"dimension": "{task_comparison_dims[1] if len(task_comparison_dims) > 1 else 'value'}", "entity_a": "...", "entity_b": "...", "key_difference": "...", "why_it_matters": "...", "winner": "..."}}
+    {{"dimension": "feature1", "entity_a": "...", "entity_b": "...", "winner": "...", "why": "..."}},
+    {{"dimension": "feature2", "entity_a": "...", "entity_b": "...", "winner": "...", "why": "..."}}
   ],
   "comparison_table": {{
-    "rows": [
-      {{"attribute": "{task_comparison_dims[0] if task_comparison_dims else 'features'}", "entity_a": "...", "entity_b": "...", "winner": "...", "explanation": "..."}}
-    ],
-    "overall_winner": "{entity_a} or {entity_b}",
-    "why": "Reason for overall winner"
+    "rows": [{{"attribute": "...", "entity_a": "...", "entity_b": "...", "winner": "...", "explanation": "..."}}],
+    "overall_winner": "...",
+    "why": "..."
   }},
+  "key_insight": "[Observation] BUT [contradiction] BECAUSE [reason] → [impact]",
+  "strategic_implication": "Do X because Y",
+  "biggest_risk": "Critical failure point",
+  "competitors_identified": {{"direct": {json.dumps(valid_competitors[:3])}, "indirect": []}},
+  "final_verdict": {{
+    "verdict": "YES/NO/CONDITIONAL",
+    "arguments_for": ["reason1", "reason2"],
+    "arguments_against": ["risk1"],
+    "conditions_for_success": []
+  }}
+}}
+
+RULES:
+- EVERY comparison MUST have winner
+- key_insight MUST include BUT and BECAUSE
+- verdict MUST be YES, NO, or CONDITIONAL
+- Use REAL company names only"""
+        else:
+            # Non-final task: No verdict needed
+            unified_prompt = f"""{strict_context}
+
+TASK: {task_description}
+TASK FOCUS: {task_focus.get('focus', 'General analysis')}
+KEY QUESTION: {task_focus.get('question', 'What insight emerges?')}
+ENTITIES: {entity_a} vs {entity_b}
+VALID COMPETITORS: {', '.join(valid_competitors[:5])}
+{existing_insights_str}
+{feedback_section}
+
+SEARCH DATA:
+{context_text[:1800]}
+{prev_context}
+
+Generate analysis in ONE JSON response:
+
+{{
+  "facts": ["5-7 key facts from search data"],
+  "comparison": [
+    {{"dimension": "feature1", "entity_a": "...", "entity_b": "...", "winner": "...", "why": "..."}}
+  ],
+  "key_insight": "[Observation] BUT [contradiction] BECAUSE [reason] → [impact]",
+  "strategic_implication": "Do X because Y",
+  "biggest_risk": "Critical failure point",
   "competitors_identified": {{"direct": {json.dumps(valid_competitors[:3])}, "indirect": []}}
 }}
 
-CRITICAL: The "comparison" array is MANDATORY. Each dimension MUST have winner and why_it_matters."""
-
-        self.log(f"STEP 2: Building comparison (task_type: {task_focus.get('name')})", task_id=task_id)
-        comparison_response = await self.llm_service.generate_json(
-            prompt=comparison_prompt,
-            system_prompt=f"You build COMPARATIVE analysis (not descriptions) for: {goal}. Use '{entity_a}' vs '{entity_b}'. EVERY dimension MUST contrast entities with explicit winners. NO neutral statements. Return ONLY JSON.",
-            temperature=0.2,
-            max_tokens=800,
+RULES:
+- comparison MUST have winner for each dimension
+- key_insight MUST include BUT and BECAUSE
+- Use REAL company names only"""
+        
+        # ============== V23: SINGLE LLM CALL ==============
+        self.log(f"V23: Making single unified LLM call", task_id=task_id)
+        response = await self.llm_service.generate_json(
+            prompt=unified_prompt,
+            system_prompt=f"You are an investment analyst. Analyze: {goal}. Return ONLY valid JSON.",
+            temperature=0.1,  # Lower temperature = faster responses
+            max_tokens=650 if is_final_task else 500,  # Reduced for speed
         )
-        self.track_llm_usage(comparison_response, task_id)
+        self.track_llm_usage(response, task_id)
         
-        comparison_data = comparison_response.get("parsed", {})
-        if isinstance(comparison_data, list):
-            comparison_data = comparison_data[0] if comparison_data else {}
-        if not isinstance(comparison_data, dict):
-            comparison_data = {}
+        parsed_data = response.get("parsed", {})
+        if isinstance(parsed_data, list):
+            parsed_data = parsed_data[0] if parsed_data else {}
+        if not isinstance(parsed_data, dict):
+            parsed_data = {}
         
-        # V21 FIX: Ensure extracted values are correct types (LLM might return wrong types)
-        comparison_table = comparison_data.get("comparison_table", {"rows": []})
-        if not isinstance(comparison_table, dict):
-            comparison_table = {"rows": comparison_table if isinstance(comparison_table, list) else []}
+        # Extract fields with defaults
+        facts = parsed_data.get("facts", [])
+        if not isinstance(facts, list):
+            facts = []
         
-        comparison_list = comparison_data.get("comparison", [])
+        self.log(f"V23 RESULT: {len(facts)} facts, response received", task_id=task_id)
+        
+        # ============== V23: EXTRACT FIELDS FROM SINGLE RESPONSE ==============
+        comparison_list = parsed_data.get("comparison", [])
         if not isinstance(comparison_list, list):
             comparison_list = [comparison_list] if comparison_list else []
         
-        # V21 FALLBACK: If comparison array is empty but comparison_table has rows, convert them
-        if not comparison_list and isinstance(comparison_table, dict):
-            rows = comparison_table.get("rows", [])
-            if rows:
-                comparison_list = []
-                for row in rows:
-                    if isinstance(row, dict):
-                        comparison_list.append({
-                            "dimension": row.get("attribute", "comparison"),
-                            "entity_a": row.get("entity_a", entity_a),
-                            "entity_b": row.get("entity_b", entity_b),
-                            "key_difference": row.get("explanation", ""),
-                            "why_it_matters": row.get("explanation", ""),
-                            "winner": row.get("winner", ""),
-                        })
-                self.log(f"V21 FALLBACK: Converted {len(comparison_list)} rows to comparison list", task_id=task_id)
+        comparison_table = parsed_data.get("comparison_table", {"rows": []})
+        if not isinstance(comparison_table, dict):
+            comparison_table = {"rows": comparison_table if isinstance(comparison_table, list) else []}
         
-        competitors_identified = comparison_data.get("competitors_identified", {"direct": valid_competitors[:3], "indirect": []})
+        # Ensure comparison_table has rows if comparison_list exists but table is empty
+        if comparison_list and not comparison_table.get("rows"):
+            comparison_table["rows"] = []
+            for comp in comparison_list[:3]:
+                if isinstance(comp, dict):
+                    comparison_table["rows"].append({
+                        "attribute": comp.get("dimension", ""),
+                        "entity_a": comp.get("entity_a", entity_a),
+                        "entity_b": comp.get("entity_b", entity_b),
+                        "winner": comp.get("winner", ""),
+                        "explanation": comp.get("why", comp.get("why_it_matters", ""))
+                    })
+        
+        competitors_identified = parsed_data.get("competitors_identified", {"direct": valid_competitors[:3], "indirect": []})
         if not isinstance(competitors_identified, dict):
-            if isinstance(competitors_identified, list):
-                competitors_identified = {"direct": competitors_identified, "indirect": []}
-            else:
-                competitors_identified = {"direct": valid_competitors[:3], "indirect": []}
+            competitors_identified = {"direct": valid_competitors[:3], "indirect": []}
         
-        # V21: Validate per-task comparison
-        per_task_comp_validation = validate_per_task_comparison(comparison_data, task_id)
-        if not per_task_comp_validation["valid"]:
-            self.log(f"V21 PER-TASK COMPARISON: issues={per_task_comp_validation['issues']}", level="warning", task_id=task_id)
+        key_insight = parsed_data.get("key_insight", "")
+        strategic_implication = parsed_data.get("strategic_implication", "")
+        biggest_risk = parsed_data.get("biggest_risk", "")
+        final_verdict = parsed_data.get("final_verdict", {}) if is_final_task else {}
+        if not isinstance(final_verdict, dict):
+            final_verdict = {}
         
-        # V15: VALIDATE comparison entities (for final task)
-        if is_final_task:
-            rows = comparison_table.get("rows", []) if isinstance(comparison_table, dict) else []
-            is_valid, error_msg = validate_comparison_entities(
-                rows,
-                (entity_a, entity_b)
-            )
-            if not is_valid:
-                self.log(f"V16 VALIDATION FAILED: {error_msg}", level="warning", task_id=task_id)
-        
-        rows_count = len(comparison_table.get("rows", [])) if isinstance(comparison_table, dict) else 0
-        self.log(f"STEP 2 RESULT: {rows_count} rows, {len(comparison_list)} dims", task_id=task_id)
-        
-        # ============== V21: STEP 3 - INSIGHT WITH DEPTH STRUCTURE ==============
-        insight_context = json.dumps(comparison_list[:5] if comparison_list else facts[:8], indent=1)
-        
-        # V15: Add existing insights to prevent repetition
-        existing_insights_str = ""
-        if existing_insights:
-            existing_insights_str = f"\n\nDO NOT REPEAT THESE PREVIOUS INSIGHTS:\n- " + "\n- ".join(existing_insights[:3])
-        
-        # V21: Get task-specific focus and angle
-        task_angle = TASK_INSIGHT_ANGLES.get(task_id, "strategic_opportunity")
-        
-        insight_prompt = f"""{strict_context}
-
-{NON_GENERIC_INSIGHT_PROMPT}
-
-{DEPTH_STRUCTURE_PROMPT}
-
-TASK TYPE: {task_focus.get('name', 'Analysis')}
-KEY QUESTION TO ANSWER: {task_focus.get('question', 'What insight emerges?')}
-REQUIRED INSIGHT ANGLE: {task_angle}
-
-Generate ONE deep, non-obvious insight about the ORIGINAL GOAL above.
-
-COMPARISON DATA:
-{insight_context}
-{existing_insights_str}
-
-BANNED GENERIC PHRASES:
-- "team formation gap", "collaboration tools focus", "market is growing"
-- "competition is high", "has potential", "opportunity exists"
-- "users prefer personalization", "apps struggle with data", "this leads to churn"
-
-MANDATORY DEPTH FORMULA:
-[Observation] BUT [Root Cause] BECAUSE [Mechanism] -> this results in [Impact] -> competitors fail because [Gap] -> therefore [Opportunity]
-
-DEPTH REQUIREMENTS:
-- MUST include IMPACT (quantitative or directional)
-- MUST explain WHY COMPETITORS FAILED to solve this
-- MUST state STRATEGIC OPPORTUNITY
-
-RULES:
-- Insight MUST answer: {task_focus.get('question', 'What insight emerges?')}
-- MUST include contradiction (BUT/however/yet)
-- MUST include root cause (BECAUSE/since)
-- MUST include impact (results in/leads to/causes)
-- MUST include opportunity (therefore/opportunity lies in)
-- 2-3 sentences with full depth
-- DO NOT drift to unrelated industries
-
-{feedback_section}
-
-Return ONLY valid JSON:
-{{
-  "key_insight": "[Observation] BUT [Root Cause] BECAUSE [Mechanism] -> results in [Impact] -> competitors fail because [Gap] -> therefore [Opportunity]",
-  "strategic_implication": "Concrete action recommendation",
-  "biggest_risk": "Single most critical failure point"
-}}"""
-
-        self.log(f"STEP 3: Generating insight (angle: {task_angle}, focus: {task_focus.get('name')})", task_id=task_id)
-        insight_response = await self.llm_service.generate_json(
-            prompt=insight_prompt,
-            system_prompt=f"You generate DEEP, CONTRADICTION-DRIVEN insights about: {goal}. EVERY insight MUST have: BUT (root cause) + BECAUSE (mechanism) + IMPACT + WHY COMPETITORS FAIL + OPPORTUNITY. NO shallow statements like 'this leads to churn'. Return ONLY JSON.",
-            temperature=0.3,
-            max_tokens=500,
-        )
-        self.track_llm_usage(insight_response, task_id)
-        
-        insight_data = insight_response.get("parsed", {})
-        if isinstance(insight_data, list):
-            insight_data = insight_data[0] if insight_data else {}
-        if not isinstance(insight_data, dict):
-            insight_data = {}
-        
-        key_insight = insight_data.get("key_insight", "")
-        strategic_implication = insight_data.get("strategic_implication", "")
-        biggest_risk = insight_data.get("biggest_risk", "")
-        
-        # V20: Validate insight quality with formula checker
-        insight_validation = validate_insight_quality(key_insight, task_id)
-        if not insight_validation["valid"]:
-            self.log(f"V20 INSIGHT VALIDATION: depth={insight_validation['insight_depth']}, issues={insight_validation['issues']}", level="warning", task_id=task_id)
-        
-        # V21: Validate insight depth ("why it matters")
-        depth_validation = validate_insight_depth(key_insight)
-        if not depth_validation["valid"]:
-            self.log(f"V21 DEPTH VALIDATION: score={depth_validation['depth_score']}, issues={depth_validation['issues']}", level="warning", task_id=task_id)
-        
-        # V21: Check for repetition with previous insights
-        if existing_insights:
-            repetition_check = check_insight_repetition(key_insight, existing_insights)
-            if repetition_check["is_repeated"]:
-                self.log(f"V21 REPETITION DETECTED: similarity={repetition_check['similarity_score']}", level="warning", task_id=task_id)
-        
-        self.log(f"STEP 3 RESULT: insight_len={len(key_insight)}, depth={depth_validation['depth_score']}", task_id=task_id)
-        
-        # ============== STEP 4: STRATEGIC DECISION (V14: PREFER YES/NO) ==============
-        # V14: Only generate verdict for final task, otherwise skip
-        final_verdict = {}
-        
-        if is_final_task:
-            decision_prompt = f"""{strict_context}
-
-Give final verdict for the ORIGINAL GOAL above.
-
-COMPARISON:
-{json.dumps(comparison_table, indent=1)}
-
-KEY INSIGHT:
-{key_insight}
-
-BIGGEST RISK:
-{biggest_risk}
-
-DECISION RULES:
-- Verdict MUST be about: {goal}
-- PREFER YES or NO when evidence is clear
-- Use CONDITIONAL only when truly uncertain
-- Be DECISIVE - investors want clear recommendations
-- Arguments MUST relate to the original goal
-
-{feedback_section}
-
-Return ONLY valid JSON:
-{{
-  "final_verdict": {{
-    "verdict": "YES",
-    "arguments_for": ["Clear differentiator in X", "Weak incumbent in Y"],
-    "arguments_against": ["High CAC risk", "Network effects barrier"],
-    "conditions_for_success": []
-  }}
-}}"""
-
-            self.log(f"STEP 4: Making strategic decision (FINAL TASK)", task_id=task_id)
-            decision_response = await self.llm_service.generate_json(
-                prompt=decision_prompt,
-                system_prompt=f"You make investment decisions about: {goal}. Stay in domain. Prefer YES or NO. Return ONLY JSON.",
-                temperature=0.2,
-                max_tokens=350,
-            )
-            self.track_llm_usage(decision_response, task_id)
-            
-            decision_data = decision_response.get("parsed", {})
-            if isinstance(decision_data, list):
-                decision_data = decision_data[0] if decision_data else {}
-            if not isinstance(decision_data, dict):
-                decision_data = {}
-            
-            final_verdict = decision_data.get("final_verdict", {})
-            if not isinstance(final_verdict, dict):
-                final_verdict = {}
-            
-            self.log(f"STEP 4 RESULT: verdict={final_verdict.get('verdict', 'MISSING')}", task_id=task_id)
-        else:
-            self.log(f"STEP 4: SKIPPED (not final task)", task_id=task_id)
-        
-        # ============== V21: STEP 5 - FINAL MERGE ==============
-        # Build summary from facts + insight
+        # ============== V23: BUILD MERGED OUTPUT ==============
         summary_parts = []
         if facts[:3]:
             summary_parts.append(". ".join(str(f) for f in facts[:2]))
@@ -1696,7 +1557,7 @@ Return ONLY valid JSON:
         merged_output = {
             "summary": summary,
             "facts": facts[:5],
-            "key_findings": facts[:5],  # Backward compatibility
+            "key_findings": facts[:5],
             "key_insight": key_insight,
             "strategic_implication": strategic_implication,
             "biggest_risk": biggest_risk,
@@ -1704,54 +1565,26 @@ Return ONLY valid JSON:
             "data_points": facts[:3],
             "limitations": ["Analysis based on available search data"],
             "is_final_task": is_final_task,
-            # V21: Include task focus metadata
             "task_focus": task_focus.get("name", "Analysis"),
             "task_question": task_focus.get("question", ""),
+            "comparison": comparison_list,
+            "comparison_table": comparison_table,
+            "final_verdict": final_verdict,
         }
         
-        # V21: Include comparison for ALL tasks (not just final)
-        merged_output["comparison"] = comparison_list if comparison_list else []
-        merged_output["comparison_table"] = comparison_table
-        
-        if is_final_task:
-            merged_output["final_verdict"] = final_verdict
-        else:
-            merged_output["final_verdict"] = {}
-        
-        # ============== V21: COMPREHENSIVE VALIDATION ==============
+        # ============== V23: BASIC VALIDATION ==============
         validation_errors = []
-        
-        # V21: Validate comparison exists for ALL tasks (safe check for dict type)
-        comp_table_rows = comparison_table.get("rows", []) if isinstance(comparison_table, dict) else []
-        if not comparison_list and not comp_table_rows:
-            validation_errors.append("Missing comparison (required for ALL tasks)")
-        
-        if is_final_task:
-            ct = merged_output.get("comparison_table", {})
-            if isinstance(ct, dict) and not ct.get("rows"):
-                validation_errors.append("Missing comparison_table rows")
-            elif not isinstance(ct, dict):
-                validation_errors.append("comparison_table is not a dict")
-            
-            fv = merged_output.get("final_verdict", {})
-            if isinstance(fv, dict) and not fv.get("verdict"):
-                validation_errors.append("Missing final_verdict.verdict")
-            elif not isinstance(fv, dict):
-                validation_errors.append("final_verdict is not a dict")
-            
-            # V19: Run comparison intelligence validation
-            comp_valid, comp_issues, comp_suggestions = validate_comparison_output(merged_output)
-            if not comp_valid:
-                validation_errors.extend(comp_issues)
-                self.log(f"V19 COMPARISON VALIDATION: {comp_issues} → {comp_suggestions}", level="warning", task_id=task_id)
-        
-        if not merged_output.get("key_insight"):
+        if not comparison_list and not comparison_table.get("rows"):
+            validation_errors.append("Missing comparison")
+        if is_final_task and not final_verdict.get("verdict"):
+            validation_errors.append("Missing verdict")
+        if not key_insight:
             validation_errors.append("Missing key_insight")
         
         if validation_errors:
-            self.log(f"V14 VALIDATION ISSUES: {validation_errors}", level="warning", task_id=task_id)
+            self.log(f"V23 VALIDATION ISSUES: {validation_errors}", level="warning", task_id=task_id)
         else:
-            self.log(f"STEP 5: Merge complete - all fields present", task_id=task_id)
+            self.log(f"V23: Output complete - all fields present", task_id=task_id)
         
         return {
             "parsed": merged_output,

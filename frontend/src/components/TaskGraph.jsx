@@ -1,195 +1,201 @@
-import React from 'react';
-import { CheckCircle, XCircle, Clock, AlertTriangle, Loader2, Activity } from 'lucide-react';
+import React, { useMemo } from 'react';
 
+// Status colors for minimal theme
 const statusColors = {
-  pending: '#64748b',
-  in_progress: '#3b82f6',
-  validating: '#eab308',
-  completed: '#22c55e',
-  failed: '#ef4444',
-  blocked_by_failed_dependency: '#f97316',
-  skipped: '#6b7280',
+  pending: { bg: '#ffffff', border: '#e5e5e5', text: '#6b7280' },
+  in_progress: { bg: '#fef3e2', border: '#f59e0b', text: '#92400e' },
+  validating: { bg: '#fefce8', border: '#eab308', text: '#854d0e' },
+  completed: { bg: '#ecfdf5', border: '#10b981', text: '#065f46' },
+  failed: { bg: '#fef2f2', border: '#ef4444', text: '#991b1b' },
+  blocked_by_failed_dependency: { bg: '#fff7ed', border: '#f97316', text: '#9a3412' },
+  skipped: { bg: '#f9fafb', border: '#d1d5db', text: '#6b7280' },
+};
+
+// Helper to extract short task name
+const getShortTaskName = (task) => {
+  if (task.name) return task.name;
+  const desc = task.task_description || '';
+  // Extract first 2-3 meaningful words
+  const words = desc.split(' ').slice(0, 3).join(' ');
+  return words.length > 20 ? words.slice(0, 20) + '...' : words || 'Task';
 };
 
 function TaskGraph({ tasks, currentTaskId }) {
+  // Build task dependency graph
+  const { levels, taskMap, maxNodesInLevel } = useMemo(() => {
+    if (!tasks || tasks.length === 0) {
+      return { levels: {}, taskMap: {}, maxNodesInLevel: 0 };
+    }
+
+    const taskMap = {};
+    tasks.forEach((task) => {
+      taskMap[task.id] = task;
+    });
+
+    // Assign levels based on dependencies
+    const levels = {};
+    const assignLevel = (taskId, visited = new Set()) => {
+      if (visited.has(taskId)) return 0;
+      visited.add(taskId);
+      
+      const task = taskMap[taskId];
+      if (!task) return 0;
+      
+      if (levels[taskId] !== undefined) return levels[taskId];
+      
+      const deps = task.depends_on || [];
+      if (deps.length === 0) {
+        levels[taskId] = 0;
+      } else {
+        const maxDepLevel = Math.max(...deps.map(d => assignLevel(d, visited)));
+        levels[taskId] = maxDepLevel + 1;
+      }
+      
+      return levels[taskId];
+    };
+
+    tasks.forEach((task) => assignLevel(task.id));
+
+    // Group by level
+    const levelGroups = {};
+    Object.entries(levels).forEach(([taskId, level]) => {
+      if (!levelGroups[level]) levelGroups[level] = [];
+      levelGroups[level].push(taskId);
+    });
+
+    const maxNodesInLevel = Math.max(...Object.values(levelGroups).map(g => g.length), 1);
+
+    return { levels, taskMap, maxNodesInLevel, levelGroups };
+  }, [tasks]);
+
   if (!tasks || tasks.length === 0) {
     return (
-      <div className="p-8 bg-slate-800 rounded-xl border border-slate-700 text-center">
-        <p className="text-slate-400">No tasks to display</p>
+      <div className="bg-white rounded-xl border border-gray-100 p-12 text-center card-shadow">
+        <p className="text-gray-500">No tasks to display</p>
       </div>
     );
   }
 
-  // Calculate positions for tasks
-  const levels = {};
-  const taskMap = {};
-  
-  tasks.forEach((task) => {
-    taskMap[task.id] = task;
-  });
-
-  // Assign levels based on dependencies
-  const assignLevel = (taskId, visited = new Set()) => {
-    if (visited.has(taskId)) return 0;
-    visited.add(taskId);
-    
-    const task = taskMap[taskId];
-    if (!task) return 0;
-    
-    if (levels[taskId] !== undefined) return levels[taskId];
-    
-    const deps = task.depends_on || [];
-    if (deps.length === 0) {
-      levels[taskId] = 0;
-    } else {
-      const maxDepLevel = Math.max(...deps.map(d => assignLevel(d, visited)));
-      levels[taskId] = maxDepLevel + 1;
-    }
-    
-    return levels[taskId];
-  };
-
-  tasks.forEach((task) => assignLevel(task.id));
-
-  // Group tasks by level
+  // Group tasks by level for rendering
   const levelGroups = {};
   Object.entries(levels).forEach(([taskId, level]) => {
     if (!levelGroups[level]) levelGroups[level] = [];
     levelGroups[level].push(taskId);
   });
 
-  const maxLevel = Math.max(...Object.keys(levelGroups).map(Number));
-  const nodeWidth = 200;
-  const nodeHeight = 60;
-  const levelGap = 150;
-  const nodeGap = 80;
+  const maxLevel = Math.max(...Object.keys(levelGroups).map(Number), 0);
 
-  // Calculate positions
+  // Calculate positions for centered tree layout
+  const nodeWidth = 160;
+  const nodeHeight = 70;
+  const levelGap = 100; // Vertical gap between levels
+  const nodeGap = 30; // Horizontal gap between nodes
+
   const positions = {};
+  const svgWidth = Math.max((maxNodesInLevel * (nodeWidth + nodeGap)) + 100, 600);
+  
   Object.entries(levelGroups).forEach(([level, taskIds]) => {
     const levelNum = Number(level);
-    const x = 50 + levelNum * levelGap;
-    const startY = 50;
+    const y = 60 + levelNum * (nodeHeight + levelGap);
+    const totalWidth = taskIds.length * nodeWidth + (taskIds.length - 1) * nodeGap;
+    const startX = (svgWidth - totalWidth) / 2;
     
     taskIds.forEach((taskId, idx) => {
       positions[taskId] = {
-        x,
-        y: startY + idx * (nodeHeight + nodeGap),
+        x: startX + idx * (nodeWidth + nodeGap),
+        y,
+        centerX: startX + idx * (nodeWidth + nodeGap) + nodeWidth / 2,
+        centerY: y + nodeHeight / 2,
       };
     });
   });
 
-  // Calculate SVG dimensions
-  const svgWidth = 100 + (maxLevel + 1) * levelGap;
-  const maxTasksInLevel = Math.max(...Object.values(levelGroups).map(g => g.length));
-  const svgHeight = 100 + maxTasksInLevel * (nodeHeight + nodeGap);
+  const svgHeight = 100 + (maxLevel + 1) * (nodeHeight + levelGap);
 
-  // Generate edges
-  const edges = [];
+  // Generate connection paths
+  const connections = [];
   tasks.forEach((task) => {
     const deps = task.depends_on || [];
     deps.forEach((depId) => {
       if (positions[depId] && positions[task.id]) {
-        edges.push({
+        const fromPos = positions[depId];
+        const toPos = positions[task.id];
+        connections.push({
           from: depId,
           to: task.id,
-          fromPos: positions[depId],
-          toPos: positions[task.id],
+          path: generatePath(fromPos, toPos, nodeHeight),
         });
       }
     });
   });
 
   return (
-    <div className="p-4 bg-slate-800 rounded-xl border border-slate-700 overflow-auto">
-      <svg width={svgWidth} height={svgHeight} className="min-w-full">
-        <defs>
-          <marker
-            id="arrowhead"
-            markerWidth="10"
-            markerHeight="7"
-            refX="9"
-            refY="3.5"
-            orient="auto"
-          >
-            <polygon points="0 0, 10 3.5, 0 7" fill="#64748b" />
-          </marker>
-        </defs>
-
-        {/* Edges */}
-        {edges.map((edge, idx) => (
-          <line
+    <div className="bg-white rounded-xl border border-gray-100 p-6 card-shadow overflow-auto">
+      <svg width={svgWidth} height={svgHeight} className="mx-auto">
+        {/* Connection lines */}
+        {connections.map((conn, idx) => (
+          <path
             key={idx}
-            x1={edge.fromPos.x + nodeWidth}
-            y1={edge.fromPos.y + nodeHeight / 2}
-            x2={edge.toPos.x}
-            y2={edge.toPos.y + nodeHeight / 2}
-            stroke="#475569"
-            strokeWidth="2"
-            markerEnd="url(#arrowhead)"
+            d={conn.path}
+            fill="none"
+            stroke="#d1d5db"
+            strokeWidth="1.5"
           />
         ))}
 
-        {/* Nodes */}
+        {/* Task nodes */}
         {tasks.map((task) => {
           const pos = positions[task.id];
           if (!pos) return null;
 
           const isActive = task.id === currentTaskId || task.status === 'in_progress';
-          const color = statusColors[task.status] || statusColors.pending;
+          const colors = statusColors[task.status] || statusColors.pending;
 
           return (
-            <g key={task.id} transform={`translate(${pos.x}, ${pos.y})`}>
+            <g key={task.id} className={isActive ? 'graph-node-active' : ''}>
+              {/* Node rectangle */}
               <rect
+                x={pos.x}
+                y={pos.y}
                 width={nodeWidth}
                 height={nodeHeight}
-                rx="8"
-                fill={isActive ? '#1e3a5f' : '#1e293b'}
-                stroke={color}
-                strokeWidth={isActive ? 3 : 2}
-                className={isActive ? 'animate-pulse' : ''}
+                rx="12"
+                fill={colors.bg}
+                stroke={colors.border}
+                strokeWidth={isActive ? 2 : 1}
               />
+              
+              {/* Task ID ONLY - centered */}
               <text
-                x={nodeWidth / 2}
-                y={22}
+                x={pos.x + nodeWidth / 2}
+                y={pos.y + nodeHeight / 2 + 5}
                 textAnchor="middle"
-                fill={color}
-                fontSize="14"
-                fontWeight="600"
+                fill={colors.text}
+                fontSize="16"
+                fontWeight="700"
+                fontFamily="Inter, system-ui, sans-serif"
               >
                 {task.id}
-              </text>
-              <text
-                x={nodeWidth / 2}
-                y={42}
-                textAnchor="middle"
-                fill="#94a3b8"
-                fontSize="11"
-              >
-                {task.task_description?.slice(0, 25)}
-                {task.task_description?.length > 25 ? '...' : ''}
               </text>
             </g>
           );
         })}
       </svg>
-
-      {/* Legend */}
-      <div className="flex flex-wrap gap-4 mt-4 pt-4 border-t border-slate-700">
-        {Object.entries(statusColors).map(([status, color]) => (
-          <div key={status} className="flex items-center gap-2">
-            <div 
-              className="w-3 h-3 rounded-full"
-              style={{ backgroundColor: color }}
-            />
-            <span className="text-xs text-slate-400 capitalize">
-              {status.replace(/_/g, ' ')}
-            </span>
-          </div>
-        ))}
-      </div>
     </div>
   );
+}
+
+// Generate smooth path between nodes
+function generatePath(fromPos, toPos, nodeHeight) {
+  const startX = fromPos.centerX;
+  const startY = fromPos.y + nodeHeight;
+  const endX = toPos.centerX;
+  const endY = toPos.y;
+  
+  const midY = (startY + endY) / 2;
+  
+  // Create a smooth path with corners
+  return `M ${startX} ${startY} L ${startX} ${midY} L ${endX} ${midY} L ${endX} ${endY}`;
 }
 
 export default TaskGraph;

@@ -991,6 +991,104 @@ def validate_per_task_comparison(output: dict, task_id: str = None) -> dict:
     }
 
 
+# Company analysis task focus (for existing companies)
+COMPANY_TASK_FOCUS_MAP = {
+    "T1": {
+        "name": "Business Model Analysis",
+        "focus": "Business model, revenue streams, operations",
+        "question": "How does the company make money and operate?",
+        "comparison_dims": ["business_model", "revenue_streams", "operational_model"],
+    },
+    "T2": {
+        "name": "Competitive Position",
+        "focus": "Market positioning, competitive advantages",
+        "question": "How does it compare to competitors?",
+        "comparison_dims": ["market_share", "competitive_advantages", "positioning"],
+    },
+    "T3": {
+        "name": "Performance Assessment",
+        "focus": "Financial metrics, growth, efficiency",
+        "question": "How is the company performing?",
+        "comparison_dims": ["financial_metrics", "growth_rate", "profitability"],
+    },
+    "T4": {
+        "name": "Strategic Positioning",
+        "focus": "Strategy, market trends, opportunities",
+        "question": "What are the strategic opportunities and threats?",
+        "comparison_dims": ["strategic_initiatives", "market_trends", "growth_opportunities"],
+    },
+    "T5": {
+        "name": "Comprehensive Assessment",
+        "focus": "Overall evaluation and recommendations",
+        "question": "What is the overall strategic outlook?",
+        "comparison_dims": ["strengths", "weaknesses", "future_potential"],
+    },
+}
+
+# Startup/idea task focus (for startup ideas and concepts)
+STARTUP_TASK_FOCUS_MAP = {
+    "T1": {
+        "name": "User Analysis",
+        "focus": "Behavior gaps, unmet needs",
+        "question": "What do users struggle with that others miss?",
+        "comparison_dims": ["user_pain_points", "unmet_needs", "behavior_patterns"],
+    },
+    "T2": {
+        "name": "Competitor Analysis", 
+        "focus": "Direct strengths vs weaknesses",
+        "question": "Where do competitors win/lose directly?",
+        "comparison_dims": ["features", "pricing", "market_position"],
+    },
+    "T3": {
+        "name": "Market Analysis",
+        "focus": "Macro forces, trends, demand",
+        "question": "What forces shape the market?",
+        "comparison_dims": ["growth_drivers", "barriers", "customer_segments"],
+    },
+    "T4": {
+        "name": "Risk Analysis",
+        "focus": "Failure modes, tradeoffs",
+        "question": "What can go wrong and why?",
+        "comparison_dims": ["execution_risk", "market_risk", "competitive_risk"],
+    },
+    "T5": {
+        "name": "Final Synthesis",
+        "focus": "Strategic decision",
+        "question": "What should be done?",
+        "comparison_dims": ["overall_value", "feasibility", "timing"],
+    },
+}
+
+# Legacy mapping for backward compatibility
+TASK_FOCUS_MAP = STARTUP_TASK_FOCUS_MAP
+
+
+def get_task_focus_for_context(task_id: str, entity_type: str = "concept") -> dict:
+    """
+    Get task focus based on entity type (existing company vs startup/concept).
+    
+    Args:
+        task_id: Task identifier (T1, T2, etc.)
+        entity_type: Type of entity ("existing_company", "startup_idea", "concept")
+    
+    Returns:
+        Task focus dictionary with name, focus, question, and comparison_dims
+    """
+    # Use company focus map for existing companies
+    if entity_type == "existing_company":
+        task_map = COMPANY_TASK_FOCUS_MAP
+    else:
+        # Use startup focus map for startup ideas and concepts
+        task_map = STARTUP_TASK_FOCUS_MAP
+    
+    return task_map.get(task_id, {
+        "name": "General Analysis",
+        "focus": "Comprehensive analysis",
+        "question": "What should be understood?",
+        "comparison_dims": ["features", "value", "fit"],
+    })
+
+
 def get_task_focus(task_id: str) -> dict:
     """
     V21: Get the required focus area for a task to enforce uniqueness.

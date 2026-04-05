@@ -2,10 +2,26 @@
 
 import os
 from functools import lru_cache
+from pathlib import Path
 from dotenv import load_dotenv
 
-# Load .env file
-load_dotenv()
+# Load .env file - look in both backend dir and project root
+backend_dir = Path(__file__).parent
+project_root = backend_dir.parent
+
+# Try to load from backend directory first, then project root
+env_paths = [
+    backend_dir / ".env",
+    project_root / ".env",
+]
+
+for env_path in env_paths:
+    if env_path.exists():
+        load_dotenv(env_path)
+        break
+else:
+    # Fallback to default load_dotenv behavior
+    load_dotenv()
 
 
 class Settings:
@@ -33,3 +49,6 @@ class Settings:
 def get_settings() -> Settings:
     """Get cached settings instance."""
     return Settings()
+
+# Create a global settings instance for backward compatibility
+settings = get_settings()

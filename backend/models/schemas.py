@@ -22,8 +22,7 @@ class GoalType(str, Enum):
     USER_ANALYSIS = "user_analysis"
     GTM_STRATEGY = "gtm_strategy"
     INVESTMENT_ANALYSIS = "investment_analysis"
-    # Legacy alias
-    STARTUP_IDEA = "idea_analysis"
+    STARTUP_IDEA = "startup_idea"  # Changed from duplicate "idea_analysis" to unique value
 
 
 class RunStatusEnum(str, Enum):
@@ -367,6 +366,7 @@ class TaskResponse(BaseModel):
     """Task information for API responses."""
     id: str
     task_description: str
+    depends_on: List[str] = []
     status: str
     retries: int
     output: Optional[Dict[str, Any]] = None
@@ -385,8 +385,8 @@ class RunStatusResponse(BaseModel):
     tasks: List[TaskResponse] = Field(default_factory=list)
     progress: float = 0.0
     cost: Optional[Dict[str, Any]] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
 
 class RunResultResponse(BaseModel):
