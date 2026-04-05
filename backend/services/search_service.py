@@ -27,14 +27,21 @@ class SearchService:
     
     def __init__(self):
         self.client = TavilyClient(api_key=settings.tavily_api_key)
-        self.async_client = AsyncTavilyClient(api_key=settings.tavily_api_key)
+        self._async_client = None  # Lazy init for async client
         self.total_searches = 0
-        self.search_timeout = 30  # 30 second timeout for searches
+        self.search_timeout = 10  # 10 second timeout - shorter for faster fallback
+    
+    @property
+    def async_client(self):
+        """Lazy initialize async client to ensure it's created in async context."""
+        if self._async_client is None:
+            self._async_client = AsyncTavilyClient(api_key=settings.tavily_api_key)
+        return self._async_client
     
     @retry(
-        stop=stop_after_attempt(2),  # Reduced from 3
-        wait=wait_exponential(multiplier=1, min=2, max=8),
-        retry=retry_if_exception_type((Exception,)),
+        stop=stop_after_attempt(2),
+        wait=wait_exponential(multiplier=1, min=1, max=5),
+        retry=retry_if_exception_type((ConnectionError, OSError)),  # Only retry network errors, NOT timeouts
     )
     async def search(
         self,
@@ -61,11 +68,51 @@ class SearchService:
             
             logger.info(f"Tavily search: {query[:60]}...")
             
-            # Add timeout wrapper
-            response = await asyncio.wait_for(
-                self.async_client.search(**kwargs),
-                timeout=self.search_timeout
-            )
+            # Try async client first with timeout
+            response = None
+            try:
+                response = await asyncio.wait_for(
+                    self.async_client.search(**kwargs),
+                    timeout=self.search_timeout
+                )
+                logger.info(f"Async search completed")
+            except asyncio.CancelledError:
+                # Critical: propagate cancellation from outer timeout
+                logger.warning(f"Search cancelled by outer timeout")
+                raise
+            except asyncio.TimeoutError:
+                logger.warning(f"Tavily async search timed out after {self.search_timeout}s, trying sync...")
+                # Fallback to sync client via executor
+                try:
+                    loop = asyncio.get_running_loop()
+                    response = await asyncio.wait_for(
+                        loop.run_in_executor(None, lambda: self.client.search(**kwargs)),
+                        timeout=self.search_timeout
+                    )
+                    logger.info(f"Sync fallback search completed")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"Sync fallback also failed: {e}")
+                    return {"results": [], "query": query, "error": "timeout"}
+            except Exception as e:
+                logger.error(f"Tavily async search error: {str(e)}")
+                # Try sync fallback
+                try:
+                    loop = asyncio.get_running_loop()
+                    response = await asyncio.wait_for(
+                        loop.run_in_executor(None, lambda: self.client.search(**kwargs)),
+                        timeout=self.search_timeout
+                    )
+                    logger.info(f"Sync fallback search completed after async error")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e2:
+                    logger.error(f"Sync fallback also failed: {e2}")
+                    return {"results": [], "query": query, "error": str(e)}
+            
+            if response is None:
+                return {"results": [], "query": query, "error": "No response"}
             
             self.total_searches += 1
             latency = int((time.time() - start_time) * 1000)
@@ -97,6 +144,9 @@ class SearchService:
                 "latency_ms": latency,
             }
             
+        except asyncio.CancelledError:
+            logger.warning(f"Search operation cancelled")
+            raise
         except asyncio.TimeoutError:
             logger.error(f"Tavily search timeout after {self.search_timeout}s")
             raise
@@ -113,32 +163,48 @@ class SearchService:
         """Search with fallback strategies."""
         
         # Strategy 1: Direct search
+        logger.info(f"Search strategy 1: direct query '{query[:60]}...'")
         try:
             result = await self.search(query, max_results=max_results)
-            if result["results"]:
+            if result.get("results"):
+                logger.info(f"Strategy 1 success: {len(result['results'])} results")
                 return result
+            logger.info(f"Strategy 1: no results, error={result.get('error')}")
         except Exception as e:
-            logger.warning(f"Primary search failed: {e}")
+            logger.warning(f"Primary search failed: {type(e).__name__}: {e}")
+        
+        # Small delay before retry to avoid rate limiting
+        await asyncio.sleep(0.5)
         
         # Strategy 2: Simplified query (use first part only)
         simplified_query = " ".join(query.split()[:8])
+        logger.info(f"Search strategy 2: simplified query '{simplified_query}'")
         try:
             result = await self.search(simplified_query, max_results=max_results)
-            if result["results"]:
+            if result.get("results"):
+                logger.info(f"Strategy 2 success: {len(result['results'])} results")
                 return result
+            logger.info(f"Strategy 2: no results, error={result.get('error')}")
         except Exception as e:
-            logger.warning(f"Simplified search failed: {e}")
+            logger.warning(f"Simplified search failed: {type(e).__name__}: {e}")
+        
+        # Small delay before retry
+        await asyncio.sleep(0.5)
         
         # Strategy 3: Entity name only
         if entity_name:
+            logger.info(f"Search strategy 3: entity name '{entity_name}'")
             try:
                 result = await self.search(entity_name, max_results=max_results)
-                if result["results"]:
+                if result.get("results"):
+                    logger.info(f"Strategy 3 success: {len(result['results'])} results")
                     return result
+                logger.info(f"Strategy 3: no results, error={result.get('error')}")
             except Exception as e:
-                logger.warning(f"Entity search failed: {e}")
+                logger.warning(f"Entity search failed: {type(e).__name__}: {e}")
         
         # Return empty result
+        logger.warning(f"All search strategies failed for: {query[:100]}")
         return {
             "query": query,
             "results": [],

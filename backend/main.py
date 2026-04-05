@@ -79,3 +79,16 @@ async def health():
         "status": "healthy" if db_ok else "unhealthy",
         "database": "connected" if db_ok else "disconnected",
     }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    # Use settings from config
+    uvicorn.run(
+        "main:app",
+        host=settings.host,
+        port=3001,  # Override port to 3001 for frontend compatibility
+        reload=settings.debug,
+        log_level="info"
+    )

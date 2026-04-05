@@ -2,13 +2,14 @@
 
 import uuid
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 import json
 import logging
 import threading
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy import select, update, and_
 
 from models.schemas import (
@@ -28,6 +29,9 @@ from agents.coordinator import CoordinatorAgent
 from services.cost_tracker import get_cost_tracker, remove_cost_tracker
 
 logger = logging.getLogger(__name__)
+
+# Thread pool for non-blocking database operations
+_db_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="db_worker")
 
 router = APIRouter(prefix="/api", tags=["analysis"])
 
@@ -158,13 +162,52 @@ async def run_analysis(run_id: str, goal: str, resume: bool = False):
     coordinator = CoordinatorAgent(run_id)
     active_coordinators[run_id] = coordinator
     
-    # Set callbacks (sync versions wrapped for async)
+    # Get the current running event loop
+    loop = asyncio.get_running_loop()
+    
+    # Debounce state saves - only save every N seconds or on important events
+    last_state_save = [0.0]  # Use list for mutable closure
+    STATE_SAVE_INTERVAL = 5.0  # Save state at most every 5 seconds
+    
+    # Set callbacks - run DB operations in thread pool to avoid blocking
     async def on_state_change(state):
-        save_run_state_sync(coordinator)
+        import time
+        current_time = time.time()
+        status = state.get("status", "")
+        
+        # Always save on important status changes, otherwise debounce
+        important_statuses = ["completed", "failed", "pending_user_review"]
+        should_save = (
+            status in important_statuses or 
+            current_time - last_state_save[0] >= STATE_SAVE_INTERVAL
+        )
+        
+        if should_save:
+            last_state_save[0] = current_time
+            # Run DB save in thread pool (non-blocking)
+            loop.run_in_executor(_db_executor, save_run_state_sync, coordinator)
+        
+        # Always broadcast to websocket (fast)
         await broadcast_to_run(run_id, {"type": "state_update", "state": state})
     
     async def on_log(log_data):
-        save_log_entry_sync(run_id, log_data)
+        # Only save important logs to DB (errors, warnings, task completions, search info)
+        level = log_data.get("level", "info")
+        message = log_data.get("message", "")
+        
+        should_save_log = (
+            level in ["error", "warning"] or
+            "completed" in message.lower() or
+            "failed" in message.lower() or
+            "search" in message.lower() or
+            "results" in message.lower()
+        )
+        
+        if should_save_log:
+            # Run DB save in thread pool (non-blocking)
+            loop.run_in_executor(_db_executor, save_log_entry_sync, run_id, log_data)
+        
+        # Always broadcast to websocket (fast)
         await broadcast_to_run(run_id, {"type": "log", "log": log_data})
     
     coordinator.set_callbacks(
@@ -269,7 +312,7 @@ async def run_analysis(run_id: str, goal: str, resume: bool = False):
 
 
 @router.post("/start-analysis", response_model=AnalysisResponse)
-async def start_analysis(request: AnalysisRequest, background_tasks: BackgroundTasks):
+async def start_analysis(request: AnalysisRequest):
     """Start a new analysis run."""
     try:
         run_id = str(uuid.uuid4())
@@ -283,8 +326,30 @@ async def start_analysis(request: AnalysisRequest, background_tasks: BackgroundT
             )
             session.add(run)
         
-        # Start background task
-        background_tasks.add_task(run_analysis, run_id, request.goal)
+        # Start background task with proper error handling
+        async def safe_run_analysis():
+            try:
+                print(f"[DEBUG] Starting analysis {run_id}")
+                await run_analysis(run_id, request.goal)
+                print(f"[DEBUG] Analysis {run_id} completed")
+            except Exception as e:
+                print(f"[ERROR] Analysis {run_id} failed with error: {e}")
+                print(f"[ERROR] Traceback:", exc_info=True)
+                import traceback
+                traceback.print_exc()
+                logger.error(f"Analysis {run_id} failed: {e}")
+                # Update run status to failed in database
+                try:
+                    with get_db_session() as session:
+                        run = session.query(Run).filter(Run.id == run_id).first()
+                        if run:
+                            run.status = RunStatus.FAILED.value
+                            run.final_report = f"Analysis failed: {str(e)}"
+                            session.commit()
+                except Exception as db_error:
+                    logger.error(f"Failed to update run status: {db_error}")
+        
+        asyncio.create_task(safe_run_analysis())
         
         return AnalysisResponse(
             run_id=run_id,
@@ -335,6 +400,7 @@ async def get_status(run_id: str):
                 task_responses.append(TaskResponse(
                     id=t.task_id or f"T{t.id}",  # Fallback if task_id is None
                     task_description=t.task_description or "",
+                    depends_on=t.depends_on or [],
                     status=t.status or "pending",
                     retries=t.retries or 0,
                     output=t.output,
@@ -357,8 +423,8 @@ async def get_status(run_id: str):
                     "total_tokens": cost.total_tokens if cost else 0,
                     "estimated_cost_usd": cost.estimated_cost_usd if cost else 0,
                 },
-                created_at=run.created_at,
-                updated_at=run.updated_at,
+                created_at=run.created_at or datetime.utcnow(),
+                updated_at=run.updated_at or datetime.utcnow(),
             )
     except HTTPException:
         raise
@@ -384,10 +450,22 @@ async def get_result(run_id: str):
                 RunStatus.PENDING_USER_REVIEW.value,
                 RunStatus.COMPLETED.value,
             ]:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Run not ready. Current status: {run.status}",
-                )
+                # Check if still executing
+                if run.status == RunStatus.EXECUTING.value:
+                    raise HTTPException(
+                        status_code=202,  # 202 Accepted - still processing
+                        detail=f"Analysis still in progress. Please wait and try again.",
+                    )
+                elif run.status == RunStatus.FAILED.value:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Analysis failed. Check logs for details.",
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Run not ready. Current status: {run.status}",
+                    )
             
             # Get tasks
             tasks_result = session.execute(
@@ -407,6 +485,7 @@ async def get_result(run_id: str):
                 task_responses.append(TaskResponse(
                     id=t.task_id or f"T{t.id}",
                     task_description=t.task_description or "",
+                    depends_on=t.depends_on or [],
                     status=t.status or "pending",
                     retries=t.retries or 0,
                     output=t.output,
@@ -504,7 +583,7 @@ async def get_logs(run_id: str, limit: int = 100, offset: int = 0):
             result = session.execute(
                 select(Log)
                 .where(Log.run_id == run_id)
-                .order_by(Log.created_at.desc())
+                .order_by(Log.id.desc())  # Use id instead of created_at for ordering
                 .limit(limit)
                 .offset(offset)
             )
@@ -512,6 +591,9 @@ async def get_logs(run_id: str, limit: int = 100, offset: int = 0):
             
             log_entries = []
             for log in logs:
+                # Handle None created_at gracefully
+                created_at = log.created_at if log.created_at is not None else datetime.now()
+                
                 log_entries.append(LogEntry(
                     id=log.id,
                     agent=log.agent or "unknown",
@@ -519,7 +601,7 @@ async def get_logs(run_id: str, limit: int = 100, offset: int = 0):
                     message=log.message or "",
                     task_id=log.task_id,
                     latency_ms=log.latency_ms,
-                    created_at=log.created_at,
+                    created_at=created_at,
                 ))
             
             return LogsResponse(
@@ -532,7 +614,7 @@ async def get_logs(run_id: str, limit: int = 100, offset: int = 0):
 
 
 @router.post("/resume/{run_id}")
-async def resume_run(run_id: str, background_tasks: BackgroundTasks):
+async def resume_run(run_id: str):
     """Resume a failed or incomplete run."""
     with get_db_session() as session:
         result = session.execute(
@@ -558,8 +640,8 @@ async def resume_run(run_id: str, background_tasks: BackgroundTasks):
             .values(status=RunStatus.EXECUTING.value)
         )
     
-    # Start background task with resume flag
-    background_tasks.add_task(run_analysis, run_id, goal, resume=True)
+    # Start background task with resume flag using asyncio.create_task
+    asyncio.create_task(run_analysis(run_id, goal, resume=True))
     
     return {"status": "resumed", "message": "Run resumed"}
 

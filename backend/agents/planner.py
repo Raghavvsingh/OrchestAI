@@ -153,6 +153,141 @@ class PlannerAgent(BaseAgent):
         self.max_retries = 3  # Increased retries for better LLM success rate
         self.min_tasks = 3  # Allow flexibility (3-5 tasks)
         self.max_tasks = 5  # HARD LIMIT: Maximum 5 tasks
+        
+        # Known established companies for quick entity type detection
+        self.known_companies = {
+            # Tech giants
+            'google', 'amazon', 'apple', 'microsoft', 'meta', 'facebook', 'netflix',
+            # Indian companies
+            'swiggy', 'zomato', 'flipkart', 'paytm', 'ola', 'uber', 'rapido',
+            'byju', 'unacademy', 'phonepe', 'myntra', 'meesho', 'cred', 'razorpay',
+            # Global brands
+            'spotify', 'airbnb', 'tesla', 'nike', 'mcdonalds', 'starbucks', 'walmart',
+            'linkedin', 'twitter', 'instagram', 'whatsapp', 'slack', 'zoom', 'notion',
+            # Automotive
+            'hyundai', 'toyota', 'ford', 'bmw', 'mercedes', 'volkswagen', 'honda', 'kia',
+            'tesla', 'gm', 'general motors', 'nissan', 'mazda', 'audi', 'porsche',
+            # Add more as needed
+        }
+    
+    async def _classify_with_llm(self, goal: str) -> Dict[str, Any]:
+        """Use LLM to classify intent and detect entity type."""
+        classification_prompt = f"""Analyze this query and classify it:
+
+Query: "{goal}"
+
+Return JSON with:
+{{
+    "goal_type": "idea_analysis" | "comparison" | "single_entity" | "market_analysis",
+    "entity_type": "existing_company" | "startup_idea" | "concept" | "market",
+    "entities": ["entity1", "entity2"],
+    "domain": "automotive" | "fintech" | "foodtech" | "ecommerce" | "saas" | "ai" | "healthtech" | "edtech" | "logistics" | "mobility" | "general",
+    "primary_focus": "brief description of what user wants to know",
+    "confidence": 0.0-1.0
+}}
+
+IMPORTANT - Entity Type Detection Rules:
+1. "existing_company": If the entity is a known/established company or business (e.g., Hyundai, Swiggy, Microsoft, Tesla, Airbnb, DoorDash, Stripe, etc.)
+   - Companies that are operating and have customers/revenue
+   - Well-known brands or established businesses
+   - Even if you haven't heard of it, if it sounds like a company name (capitalized, no "idea" context)
+
+2. "startup_idea": ONLY if query explicitly mentions:
+   - "startup idea", "business idea", "app idea", "new business"
+   - "build a", "create a", "launch a" (describing something new to create)
+   - "validate", "feasibility study" (for a proposed concept)
+
+3. "concept": Generic concepts or descriptions without specific company names
+
+4. "market": When asking about an entire market/industry
+
+Examples:
+- "Analyze Hyundai" → existing_company (it's a real car manufacturer)
+- "Analyze TechCorp" → existing_company (sounds like a company name)  
+- "Startup idea: AI fitness coach" → startup_idea (explicitly says "startup idea")
+- "Build a food delivery app" → startup_idea (describes creating something new)
+- "Analyze the fintech market" → market
+
+Default to "existing_company" for capitalized proper nouns unless clear startup indicators are present."""
+
+        try:
+            response = await self.llm_service.generate(
+                prompt=classification_prompt,
+                system_prompt="You are an intent classifier. Return only valid JSON. Be accurate in distinguishing existing companies from startup ideas.",
+                temperature=0.0,
+                max_tokens=300,
+                json_mode=True,
+            )
+            
+            classification = json.loads(response.get("content", "{}"))
+            self.track_llm_usage(response)
+            return classification
+        except Exception as e:
+            self.log(f"LLM classification failed: {e}", level="warning")
+            # Don't return empty dict - this causes cascade failures
+            # Return None to trigger fallback behavior
+            return None
+    
+    def _detect_entity_type(self, goal: str, entities: List[str]) -> str:
+        """
+        Detect if entities are existing companies or startup ideas.
+        Uses heuristics as fallback when LLM classification is unavailable.
+        """
+        goal_lower = goal.lower()
+        
+        # PRIORITY 1: Check for EXPLICIT startup indicators (high confidence)
+        startup_patterns = [
+            r'\bstartup\s*idea\b', r'\bbusiness\s*idea\b', r'\bapp\s*idea\b',
+            r'\bproduct\s*idea\b', r'\bnew\s*(business|product|app|platform)\b',
+            r'\bbuild\s+a\b', r'\bcreate\s+a\b', r'\blaunch\s+a\b',
+            r'\bproposed\b', r'\bvalidate\b', r'\bfeasibility\b',
+            r'\bwant\s+to\s+build\b', r'\bwant\s+to\s+create\b'
+        ]
+        
+        for pattern in startup_patterns:
+            if re.search(pattern, goal_lower):
+                return "startup_idea"
+        
+        # PRIORITY 2: Check known companies list (fast path)
+        for entity in entities:
+            entity_lower = entity.lower()
+            for company in self.known_companies:
+                if company in entity_lower:
+                    return "existing_company"
+        
+        # PRIORITY 3: Heuristics for company detection
+        # Check if entity looks like a company name
+        for entity in entities:
+            entity_lower = entity.lower()
+            
+            # Check for company suffixes
+            company_indicators = ['ltd', 'inc', 'corp', 'corporation', 'company', 'co.', 'llc', 'limited']
+            if any(indicator in entity_lower for indicator in company_indicators):
+                return "existing_company"
+            
+            # If entity is capitalized and not in a "build/create" context, assume it's a company
+            # (e.g., "Analyze MyCompany" suggests MyCompany is real)
+            if entity[0].isupper() and not any(word in goal_lower for word in ['build', 'create', 'idea', 'new', 'proposed']):
+                # Additional check: if the goal starts with analysis verbs, it's likely an existing entity
+                analysis_verbs = ['analyze', 'analyse', 'review', 'study', 'evaluate', 'assess', 'research', 'examine']
+                if any(goal_lower.startswith(verb) for verb in analysis_verbs):
+                    return "existing_company"
+        
+        # PRIORITY 4: Check for descriptive concepts (suggests startup idea)
+        # If entities contain generic descriptions rather than proper nouns
+        descriptive_words = ['platform', 'app', 'service', 'solution', 'system', 'tool', 'marketplace']
+        for entity in entities:
+            entity_lower = entity.lower()
+            # If entity has descriptive words AND no capitalized name, it's a concept
+            if any(desc in entity_lower for desc in descriptive_words) and not entity[0].isupper():
+                return "concept"
+        
+        # DEFAULT: If user is asking to "analyze X" where X is a proper noun, assume existing company
+        # This handles unknown companies that aren't in our list
+        if entities and entities[0][0].isupper():
+            return "existing_company"
+        
+        return "concept"
     
     def _detect_goal_type(self, goal: str) -> GoalType:
         """Detect the type of goal from the text."""
@@ -187,48 +322,105 @@ class PlannerAgent(BaseAgent):
         
         return GoalType.SINGLE_ENTITY
     
-    def _extract_classification(self, goal: str, goal_type: GoalType) -> Dict[str, Any]:
-        """Extract classification metadata from goal."""
+    async def _extract_classification(self, goal: str, goal_type: GoalType) -> Dict[str, Any]:
+        """Extract classification metadata from goal using LLM."""
         goal_lower = goal.lower()
         
-        # Extract domain
+        # Try LLM classification first for better accuracy
+        llm_classification = await self._classify_with_llm(goal)
+        
+        # Extract domain with word boundary matching to avoid false positives (e.g., "ai" in "Hyundai")
         domain_keywords = {
+            'automotive': ['car', 'vehicle', 'automotive', 'hyundai', 'toyota', 'tesla', 'ford', 'bmw', 'mercedes', 'volkswagen', 'kia'],
             'fitness': ['fitness', 'gym', 'workout', 'exercise'],
-            'fintech': ['fintech', 'banking', 'payment', 'finance'],
-            'edtech': ['education', 'learning', 'student', 'college'],
-            'ecommerce': ['ecommerce', 'shop', 'retail', 'marketplace'],
-            'saas': ['saas', 'software', 'platform', 'tool'],
-            'foodtech': ['food', 'delivery', 'restaurant'],
-            'healthtech': ['health', 'medical', 'healthcare'],
-            'ai': ['ai', 'artificial intelligence', 'ml', 'machine learning'],
+            'fintech': ['fintech', 'banking', 'payment', 'finance', 'wallet'],
+            'edtech': ['education', 'learning', 'student', 'college', 'course'],
+            'ecommerce': ['ecommerce', 'shop', 'retail', 'marketplace', 'shopping'],
+            'saas': ['saas', 'software', 'platform', 'tool', 'app'],
+            'foodtech': ['food', 'delivery', 'restaurant', 'dining', 'meal', 'swiggy', 'zomato'],
+            'healthtech': ['health', 'medical', 'healthcare', 'doctor', 'hospital'],
+            'ai': [r'\bai\b', r'\bartificial intelligence\b', r'\bml\b', r'\bmachine learning\b', r'\bllm\b', r'\bopenai\b'],
+            'logistics': ['logistics', 'shipping', 'transport', 'courier'],
+            'mobility': ['ride', 'cab', 'taxi', 'ola', 'uber', 'lyft'],
         }
         
         domain = 'general'
         for d, keywords in domain_keywords.items():
-            if any(kw in goal_lower for kw in keywords):
-                domain = d
+            for kw in keywords:
+                # Use regex for word boundary matching (especially for short words like 'ai', 'ml')
+                if kw.startswith(r'\b'):
+                    if re.search(kw, goal_lower):
+                        domain = d
+                        break
+                else:
+                    # Simple substring match for multi-word keywords and company names
+                    if kw in goal_lower:
+                        domain = d
+                        break
+            if domain != 'general':
                 break
         
         # Extract entities
-        entities = []
-        if goal_type == GoalType.COMPARISON:
-            for sep in [" vs ", " vs. ", " versus ", " compared to ", " and "]:
-                if sep in goal_lower:
-                    parts = goal.split(sep if sep in goal else sep.strip())
-                    if len(parts) >= 2:
-                        entities = [p.strip()[:50] for p in parts[:2]]
+        entities = llm_classification.get("entities", []) if llm_classification else []
+        
+        if not entities:
+            # Fallback to pattern matching
+            if goal_type == GoalType.COMPARISON:
+                for sep in [" vs ", " vs. ", " versus ", " compared to ", " compare "]:
+                    if sep in goal_lower:
+                        parts = goal.split(sep if sep in goal else sep.strip())
+                        if len(parts) >= 2:
+                            # Clean up entities
+                            entities = [p.strip().strip(":.?!").title() for p in parts[:2]]
+                            break
+            else:
+                # Extract main entity from goal - improved extraction
+                # Remove common prefixes
+                cleaned_goal = goal
+                prefixes = ["analyze", "review", "study", "evaluate", "assess"]
+                for prefix in prefixes:
+                    if goal_lower.startswith(prefix):
+                        cleaned_goal = goal[len(prefix):].strip()
                         break
+                
+                # Extract entity (up to 4 words)
+                words = cleaned_goal.split()
+                if len(words) > 0:
+                    entity_text = " ".join(words[:min(4, len(words))]).strip(":.?!")
+                    entities = [entity_text.title()]
+        
+        # Detect entity type - PRIORITIZE LLM classification
+        entity_type = llm_classification.get("entity_type") if llm_classification else None
+        
+        # Only use heuristic fallback if LLM didn't provide entity_type or has low confidence
+        if not entity_type or (llm_classification and llm_classification.get("confidence", 0) < 0.5):
+            entity_type = self._detect_entity_type(goal, entities)
+            self.log(f"Using heuristic entity type detection: {entity_type}", level="debug")
         else:
-            # Extract main entity from goal
-            words = goal.split()
-            if len(words) > 2:
-                entities = [" ".join(words[-3:]).strip(":.")]
+            self.log(f"Using LLM entity type: {entity_type} (confidence: {llm_classification.get('confidence', 0):.2f})", level="debug")
+        
+        # Override goal_type if LLM has higher confidence
+        if llm_classification and llm_classification.get("confidence", 0) > 0.7:
+            llm_goal_type = llm_classification.get("goal_type")
+            if llm_goal_type:
+                try:
+                    goal_type = GoalType(llm_goal_type)
+                except ValueError:
+                    pass  # Keep original goal_type
+        
+        # Add safety check for empty entities
+        if not entities:
+            # Use pattern extraction or generic fallback
+            self.log("No entities found, using fallback entity extraction", level="warning")
+            entities = ["the target"]  # Generic fallback to prevent empty task lists
         
         return {
             "type": goal_type.value,
             "domain": domain,
             "entities": entities,
-            "focus": "competitive analysis",
+            "entity_type": entity_type,
+            "focus": llm_classification.get("primary_focus", "competitive analysis") if llm_classification else "competitive analysis",
+            "llm_confidence": llm_classification.get("confidence", 0) if llm_classification else 0,
         }
     
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
@@ -240,16 +432,21 @@ class PlannerAgent(BaseAgent):
         
         self.log(f"Planning for goal: {goal[:80]}...")
         
-        # Detect goal type and extract classification
+        # Detect goal type and extract classification (NOW ASYNC)
         goal_type = self._detect_goal_type(goal)
-        classification = self._extract_classification(goal, goal_type)
+        classification = await self._extract_classification(goal, goal_type)
         
         # Add MASTER GREYBOX case type detection
         case_type = detect_case_type(goal, classification.get("entities", []))
         classification["case_type"] = case_type
         classification["analysis_case_type"] = case_type  # For compatibility
         
-        self.log(f"Detected: type={goal_type.value}, case_type={case_type}, domain={classification['domain']}")
+        self.log(f"Detected: type={goal_type.value}, entity_type={classification.get('entity_type')}, case_type={case_type}, domain={classification['domain']}")
+        self.log(f"Entities: {classification.get('entities', [])}")
+        
+        # If LLM classification succeeded, log confidence
+        if classification.get('llm_confidence', 0) > 0:
+            self.log(f"LLM classification confidence: {classification['llm_confidence']:.2f}")
         
         # Try LLM-based planning (PRIMARY METHOD)
         llm_errors = []
@@ -414,7 +611,7 @@ class PlannerAgent(BaseAgent):
             task_id = task.get("id")
             if task_id not in visited:
                 if has_cycle(task_id):
-                    return True
+                    return False  # Cycle found - invalid DAG
         
         return True  # No cycles found
     
@@ -500,39 +697,77 @@ class PlannerAgent(BaseAgent):
                 },
             ]
         else:
-            # Single entity / market analysis: 5 high-density tasks
-            tasks = [
-                {
-                    "id": "T1",
-                    "task": f"Analyze {entity_name}'s core offering, target market, and value proposition in {domain}",
-                    "depends_on": [],
-                    "reason": "Establishes analysis foundation"
-                },
-                {
-                    "id": "T2",
-                    "task": f"Identify key competitors to {entity_name} and compare features, pricing, and market positioning",
-                    "depends_on": ["T1"],
-                    "reason": "Competitive context"
-                },
-                {
-                    "id": "T3",
-                    "task": f"Evaluate {entity_name}'s strengths, weaknesses, and competitive advantages relative to alternatives",
-                    "depends_on": ["T2"],
-                    "reason": "Strategic position assessment"
-                },
-                {
-                    "id": "T4",
-                    "task": f"Analyze market dynamics, trends, and growth opportunities relevant to {entity_name}",
-                    "depends_on": ["T1"],
-                    "reason": "Market context and opportunities"
-                },
-                {
-                    "id": "T5",
-                    "task": f"Provide strategic assessment of {entity_name} with recommendations and key considerations",
-                    "depends_on": ["T3", "T4"],
-                    "reason": "Actionable insights and recommendations"
-                },
-            ]
+            # Single entity analysis - check if it's an existing company or startup
+            entity_type = classification.get("entity_type", "concept")
+            
+            if entity_type == "existing_company":
+                # Company analysis: Focus on performance, strategy, competitive position
+                tasks = [
+                    {
+                        "id": "T1",
+                        "task": f"Analyze {entity_name}'s business model, revenue streams, key products/services, and target market segments in {domain}",
+                        "depends_on": [],
+                        "reason": "Establishes company's core business foundation"
+                    },
+                    {
+                        "id": "T2",
+                        "task": f"Identify and analyze {entity_name}'s main competitors, their market share, competitive advantages, and strategic positioning in {domain}",
+                        "depends_on": ["T1"],
+                        "reason": "Competitive landscape and market positioning"
+                    },
+                    {
+                        "id": "T3",
+                        "task": f"Evaluate {entity_name}'s financial performance, growth metrics, profitability, and operational efficiency compared to industry benchmarks",
+                        "depends_on": ["T1", "T2"],
+                        "reason": "Performance assessment and competitive standing"
+                    },
+                    {
+                        "id": "T4",
+                        "task": f"Analyze {entity_name}'s strategic initiatives, market opportunities, challenges, and industry trends affecting {domain}",
+                        "depends_on": ["T2"],
+                        "reason": "Strategic context and future outlook"
+                    },
+                    {
+                        "id": "T5",
+                        "task": f"Provide comprehensive assessment of {entity_name}'s strengths, weaknesses, competitive threats, growth potential, and strategic recommendations",
+                        "depends_on": ["T3", "T4"],
+                        "reason": "Strategic insights and actionable recommendations"
+                    },
+                ]
+            else:
+                # Startup/concept analysis: Original approach
+                tasks = [
+                    {
+                        "id": "T1",
+                        "task": f"Analyze {entity_name}'s core offering, target market, and value proposition in {domain}",
+                        "depends_on": [],
+                        "reason": "Establishes analysis foundation"
+                    },
+                    {
+                        "id": "T2",
+                        "task": f"Identify key competitors to {entity_name} and compare features, pricing, and market positioning",
+                        "depends_on": ["T1"],
+                        "reason": "Competitive context"
+                    },
+                    {
+                        "id": "T3",
+                        "task": f"Evaluate {entity_name}'s strengths, weaknesses, and competitive advantages relative to alternatives",
+                        "depends_on": ["T2"],
+                        "reason": "Strategic position assessment"
+                    },
+                    {
+                        "id": "T4",
+                        "task": f"Analyze market dynamics, trends, and growth opportunities relevant to {entity_name}",
+                        "depends_on": ["T1"],
+                        "reason": "Market context and opportunities"
+                    },
+                    {
+                        "id": "T5",
+                        "task": f"Provide strategic assessment of {entity_name} with recommendations and key considerations",
+                        "depends_on": ["T3", "T4"],
+                        "reason": "Actionable insights and recommendations"
+                    },
+                ]
         
         return {
             "classification": classification,

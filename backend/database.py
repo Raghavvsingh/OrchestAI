@@ -1,10 +1,12 @@
 """Database connection and session management with SQLite fallback."""
 
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError, DBAPIError
 from sqlalchemy.orm import sessionmaker, declarative_base
 from contextlib import contextmanager
 import logging
 import os
+import time
 
 from config import get_settings
 
@@ -57,6 +59,15 @@ else:
         pool_pre_ping=True,
         pool_size=5,
         max_overflow=10,
+        pool_recycle=300,  # Recycle connections every 5 minutes to avoid stale connections
+        pool_timeout=30,  # Timeout for getting a connection from the pool
+        connect_args={
+            "connect_timeout": 10,
+            "keepalives": 1,
+            "keepalives_idle": 30,
+            "keepalives_interval": 10,
+            "keepalives_count": 5,
+        },
     )
 
 SessionLocal = sessionmaker(
@@ -69,9 +80,38 @@ Base = declarative_base()
 
 
 @contextmanager
-def get_db_session():
-    """Get database session."""
-    session = SessionLocal()
+def get_db_session(max_retries=3, retry_delay=1):
+    """Get database session with retry logic for connection errors."""
+    # Phase 1: Establish connection with retries
+    session = None
+    last_error = None
+    
+    for attempt in range(max_retries):
+        session = SessionLocal()
+        try:
+            # Test the connection
+            session.execute(text("SELECT 1"))
+            break  # Connection successful
+        except (OperationalError, DBAPIError) as e:
+            session.close()
+            last_error = e
+            error_msg = str(e).lower()
+            
+            # Check if it's a connection-related error worth retrying
+            if any(x in error_msg for x in ["connection", "closed", "terminated", "server"]):
+                logger.warning(f"Database connection error (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+                    engine.dispose()  # Dispose the pool to force new connections
+                    continue
+            raise
+    else:
+        # If we exhausted all retries, raise the last error
+        if last_error:
+            logger.error(f"Database connection failed after {max_retries} retries: {last_error}")
+            raise last_error
+    
+    # Phase 2: Use session (no retry around yield)
     try:
         yield session
         session.commit()

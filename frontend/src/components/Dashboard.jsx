@@ -1,39 +1,83 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { 
-  CheckCircle, 
-  XCircle, 
-  Clock, 
-  AlertTriangle, 
-  Loader2, 
-  RefreshCw,
-  ChevronRight,
-  Activity,
-  DollarSign,
-  FileText
-} from 'lucide-react';
+import { Loader2, RefreshCw, FileText, AlertCircle } from 'lucide-react';
 import { analysisApi, createWebSocket } from '../services/api';
 import TaskGraph from './TaskGraph';
 import LogViewer from './LogViewer';
 
-const statusIcons = {
-  pending: <Clock className="w-4 h-4 text-gray-400" />,
-  in_progress: <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />,
-  validating: <Activity className="w-4 h-4 text-yellow-400" />,
-  completed: <CheckCircle className="w-4 h-4 text-green-400" />,
-  failed: <XCircle className="w-4 h-4 text-red-400" />,
-  blocked_by_failed_dependency: <AlertTriangle className="w-4 h-4 text-orange-400" />,
-  skipped: <ChevronRight className="w-4 h-4 text-gray-400" />,
+// Helper to extract task name from description
+const getTaskName = (task) => {
+  if (task.name) return task.name;
+  // Try to extract a short name from description
+  const desc = task.task_description || '';
+  const words = desc.split(' ').slice(0, 3).join(' ');
+  return words.length > 25 ? words.slice(0, 25) + '...' : words || 'Task';
 };
 
-const statusColors = {
-  pending: 'bg-slate-700',
-  planning: 'bg-blue-900',
-  executing: 'bg-blue-800',
-  validating: 'bg-yellow-900',
-  pending_user_review: 'bg-purple-900',
-  completed: 'bg-green-900',
-  failed: 'bg-red-900',
+// Status pill component
+const StatusPill = ({ status }) => {
+  const statusLabels = {
+    pending: 'Pending',
+    in_progress: 'In Progress',
+    validating: 'Validating',
+    completed: 'Completed',
+    failed: 'Failed',
+    blocked_by_failed_dependency: 'Blocked',
+    skipped: 'Skipped',
+  };
+
+  return (
+    <span className={`status-pill status-pill-${status}`}>
+      {statusLabels[status] || status?.replace(/_/g, ' ')}
+    </span>
+  );
+};
+
+// Status dot component
+const StatusDot = ({ status }) => (
+  <div className={`status-dot status-dot-${status}`} />
+);
+
+// Task item component
+const TaskItem = ({ task, isActive }) => {
+  return (
+    <div
+      className={`task-item p-5 bg-white rounded-xl border transition-all duration-200 ${
+        isActive 
+          ? 'task-item-active border-amber-200 shadow-sm' 
+          : 'border-gray-100 hover:border-gray-200'
+      }`}
+    >
+      <div className="flex items-start gap-4">
+        {/* Status indicator */}
+        <div className="mt-1.5">
+          <StatusDot status={task.status} />
+        </div>
+
+        {/* Content */}
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 mb-1">
+            <span className="font-semibold text-gray-900">{task.id}</span>
+          </div>
+          <p className="text-sm text-gray-600 leading-relaxed">
+            {task.task_description}
+          </p>
+          
+          {task.error && (
+            <p className="text-red-500 text-sm mt-2 flex items-center gap-1">
+              <AlertCircle className="w-3.5 h-3.5" />
+              {task.error}
+            </p>
+          )}
+        </div>
+
+        {/* Status pill */}
+        <div className="flex-shrink-0">
+          <StatusPill status={task.status} />
+        </div>
+      </div>
+    </div>
+  );
 };
 
 function Dashboard() {
@@ -51,7 +95,6 @@ function Dashboard() {
       const data = await analysisApi.getStatus(runId);
       setStatus(data);
       
-      // Check if completed
       if (['completed', 'pending_user_review'].includes(data.status)) {
         if (pollIntervalRef.current) {
           clearInterval(pollIntervalRef.current);
@@ -65,23 +108,24 @@ function Dashboard() {
   const fetchLogs = useCallback(async () => {
     try {
       const data = await analysisApi.getLogs(runId);
-      setLogs(data.logs || []);
+      // Only set logs if we don't have any (initial load), otherwise accumulate via websocket
+      if (logs.length === 0) {
+        setLogs(data.logs || []);
+      }
     } catch (err) {
       console.error('Failed to fetch logs:', err);
     }
-  }, [runId]);
+  }, [runId, logs.length]);
 
   useEffect(() => {
     fetchStatus();
     fetchLogs();
 
-    // Set up polling
     pollIntervalRef.current = setInterval(() => {
       fetchStatus();
       fetchLogs();
-    }, 3000);
+    }, 2000);
 
-    // Set up WebSocket
     try {
       const wsConnection = createWebSocket(
         runId,
@@ -90,16 +134,18 @@ function Dashboard() {
             setStatus((prev) => ({
               ...prev,
               ...data.state,
-              tasks: data.state.tasks?.map((t, idx) => ({
+              tasks: data.state.tasks?.map((t) => ({
                 id: t.id,
                 task_description: t.task,
+                depends_on: t.depends_on || [],
                 status: data.state.task_statuses?.[t.id] || 'pending',
                 retries: data.state.task_retries?.[t.id] || 0,
                 output: data.state.task_outputs?.[t.id],
               })) || prev?.tasks,
             }));
           } else if (data.type === 'log') {
-            setLogs((prev) => [data.log, ...prev].slice(0, 100));
+            // Accumulate all logs, no limit
+            setLogs((prev) => [...prev, data.log]);
           } else if (data.type === 'completed') {
             fetchStatus();
           }
@@ -134,15 +180,18 @@ function Dashboard() {
     }
   };
 
+  // Error state
   if (error) {
     return (
-      <div className="p-8 bg-red-900/30 border border-red-700 rounded-xl text-center">
-        <XCircle className="w-12 h-12 text-red-400 mx-auto mb-4" />
-        <h2 className="text-xl font-semibold text-white mb-2">Error</h2>
-        <p className="text-red-200">{error}</p>
+      <div className="bg-white rounded-xl border border-gray-100 p-10 text-center card-shadow">
+        <div className="w-12 h-12 bg-red-50 rounded-full flex items-center justify-center mx-auto mb-4">
+          <AlertCircle className="w-6 h-6 text-red-500" />
+        </div>
+        <h2 className="text-lg font-semibold text-gray-900 mb-2">Something went wrong</h2>
+        <p className="text-gray-500 mb-6">{error}</p>
         <button
           onClick={() => navigate('/')}
-          className="mt-4 px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg text-white"
+          className="px-5 py-2.5 bg-gray-900 hover:bg-gray-800 rounded-lg text-white text-sm font-medium transition-colors"
         >
           Start New Analysis
         </button>
@@ -150,10 +199,11 @@ function Dashboard() {
     );
   }
 
+  // Loading state
   if (!status) {
     return (
       <div className="flex items-center justify-center h-64">
-        <Loader2 className="w-8 h-8 text-blue-400 animate-spin" />
+        <Loader2 className="w-6 h-6 text-gray-400 animate-spin" />
       </div>
     );
   }
@@ -164,30 +214,29 @@ function Dashboard() {
   const totalTasks = status.tasks?.length || 0;
 
   return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div className={`p-6 rounded-xl ${statusColors[status.status] || 'bg-slate-800'} border border-slate-700`}>
-        <div className="flex items-start justify-between">
+    <div className="space-y-8">
+      {/* Execution Card */}
+      <div className="bg-white rounded-xl border border-gray-100 p-8 card-shadow">
+        <div className="flex items-start justify-between mb-6">
           <div>
-            <div className="flex items-center gap-2 mb-2">
-              <span className="px-3 py-1 bg-slate-800 rounded-full text-sm font-medium text-white capitalize">
-                {status.status?.replace(/_/g, ' ')}
-              </span>
-              {status.goal_type && (
-                <span className="px-3 py-1 bg-blue-900 rounded-full text-sm text-blue-200">
-                  {status.goal_type}
-                </span>
-              )}
-            </div>
-            <h2 className="text-xl font-semibold text-white mb-1">{status.goal}</h2>
-            <p className="text-slate-400 text-sm">Run ID: {runId}</p>
+            {/* Status badge */}
+            <span className="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-emerald-50 text-emerald-700 border border-emerald-100 mb-4">
+              {status.status === 'executing' || status.status === 'in_progress' ? 'Executing' : 
+               status.status?.replace(/_/g, ' ').charAt(0).toUpperCase() + status.status?.replace(/_/g, ' ').slice(1)}
+            </span>
+            
+            {/* Title */}
+            <h1 className="text-2xl font-bold text-gray-900">
+              {status.goal || 'Analysis'}
+            </h1>
           </div>
           
+          {/* Action buttons */}
           <div className="flex gap-3">
             {status.status === 'failed' && (
               <button
                 onClick={handleResume}
-                className="px-4 py-2 bg-yellow-600 hover:bg-yellow-700 rounded-lg text-white flex items-center gap-2"
+                className="px-4 py-2 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg text-amber-700 text-sm font-medium flex items-center gap-2 transition-colors"
               >
                 <RefreshCw className="w-4 h-4" />
                 Resume
@@ -196,7 +245,7 @@ function Dashboard() {
             {['completed', 'pending_user_review'].includes(status.status) && (
               <button
                 onClick={handleViewReport}
-                className="px-4 py-2 bg-green-600 hover:bg-green-700 rounded-lg text-white flex items-center gap-2"
+                className="px-4 py-2 bg-gray-900 hover:bg-gray-800 rounded-lg text-white text-sm font-medium flex items-center gap-2 transition-colors"
               >
                 <FileText className="w-4 h-4" />
                 View Report
@@ -205,116 +254,85 @@ function Dashboard() {
           </div>
         </div>
 
-        {/* Progress bar */}
-        <div className="mt-4">
-          <div className="flex justify-between text-sm text-slate-400 mb-2">
-            <span>Progress</span>
-            <span>{completedTasks} / {totalTasks} tasks</span>
+        {/* Progress section */}
+        <div>
+          <div className="flex justify-between items-center mb-3">
+            <span className="text-sm text-gray-500">Progress</span>
+            <span className="text-sm text-gray-500">{completedTasks} / {totalTasks} tasks</span>
           </div>
-          <div className="h-2 bg-slate-700 rounded-full overflow-hidden">
+          <div className="progress-bar-track">
             <div 
-              className="h-full bg-blue-500 transition-all duration-500"
+              className="progress-bar-fill"
               style={{ width: `${totalTasks > 0 ? (completedTasks / totalTasks) * 100 : 0}%` }}
             />
           </div>
         </div>
-
-        {/* Cost */}
-        {status.cost && (
-          <div className="mt-4 flex items-center gap-4 text-sm">
-            <div className="flex items-center gap-1 text-slate-400">
-              <DollarSign className="w-4 h-4" />
-              <span>Cost: ${status.cost.estimated_cost_usd?.toFixed(4) || '0.0000'}</span>
-            </div>
-            <div className="text-slate-400">
-              Tokens: {status.cost.total_tokens?.toLocaleString() || 0}
-            </div>
-          </div>
-        )}
       </div>
 
-      {/* Tabs */}
-      <div className="flex gap-2 border-b border-slate-700">
+      {/* Tab Navigation */}
+      <div className="flex gap-8 border-b border-gray-200">
         <button
           onClick={() => setActiveTab('tasks')}
-          className={`px-4 py-2 font-medium transition-colors ${
+          className={`pb-3 text-sm font-medium transition-colors relative ${
             activeTab === 'tasks'
-              ? 'text-blue-400 border-b-2 border-blue-400'
-              : 'text-slate-400 hover:text-white'
+              ? 'text-gray-900'
+              : 'text-gray-500 hover:text-gray-700'
           }`}
         >
           Tasks
+          {activeTab === 'tasks' && (
+            <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-gray-900" />
+          )}
         </button>
         <button
           onClick={() => setActiveTab('graph')}
-          className={`px-4 py-2 font-medium transition-colors ${
+          className={`pb-3 text-sm font-medium transition-colors relative ${
             activeTab === 'graph'
-              ? 'text-blue-400 border-b-2 border-blue-400'
-              : 'text-slate-400 hover:text-white'
+              ? 'text-gray-900'
+              : 'text-gray-500 hover:text-gray-700'
           }`}
         >
           Graph
+          {activeTab === 'graph' && (
+            <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-gray-900" />
+          )}
         </button>
         <button
           onClick={() => setActiveTab('logs')}
-          className={`px-4 py-2 font-medium transition-colors ${
+          className={`pb-3 text-sm font-medium transition-colors relative ${
             activeTab === 'logs'
-              ? 'text-blue-400 border-b-2 border-blue-400'
-              : 'text-slate-400 hover:text-white'
+              ? 'text-gray-900'
+              : 'text-gray-500 hover:text-gray-700'
           }`}
         >
           Logs ({logs.length})
+          {activeTab === 'logs' && (
+            <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-gray-900" />
+          )}
         </button>
       </div>
 
       {/* Content */}
       {activeTab === 'tasks' && (
         <div className="space-y-3">
-          {status.tasks?.map((task) => (
-            <div
-              key={task.id}
-              className={`p-4 rounded-lg border ${
-                task.status === 'in_progress'
-                  ? 'border-blue-500 bg-blue-900/20 animate-pulse-glow'
-                  : 'border-slate-700 bg-slate-800'
-              }`}
-            >
-              <div className="flex items-start justify-between">
-                <div className="flex items-start gap-3">
-                  {statusIcons[task.status] || statusIcons.pending}
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <span className="font-medium text-white">{task.id}</span>
-                      <span className={`px-2 py-0.5 rounded text-xs status-${task.status}`}>
-                        {task.status?.replace(/_/g, ' ')}
-                      </span>
-                      {task.retries > 0 && (
-                        <span className="text-xs text-yellow-400">
-                          ({task.retries} retries)
-                        </span>
-                      )}
-                    </div>
-                    <p className="text-slate-300 mt-1">{task.task_description}</p>
-                    
-                    {task.error && (
-                      <p className="text-red-400 text-sm mt-2">{task.error}</p>
-                    )}
-                    
-                    {task.confidence && (
-                      <div className="mt-2 text-sm text-slate-400">
-                        Confidence: {(task.confidence * 100).toFixed(0)}%
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </div>
-            </div>
+          {status.tasks
+            ?.sort((a, b) => {
+              // Sort by task_id (T1, T2, T3, etc.)
+              const getTaskNumber = (id) => parseInt(id.replace('T', '')) || 0;
+              return getTaskNumber(a.id) - getTaskNumber(b.id);
+            })
+            .map((task) => (
+            <TaskItem 
+              key={task.id} 
+              task={task} 
+              isActive={task.status === 'in_progress'} 
+            />
           ))}
 
           {(!status.tasks || status.tasks.length === 0) && (
-            <div className="text-center py-12 text-slate-400">
-              <Loader2 className="w-8 h-8 animate-spin mx-auto mb-4" />
-              <p>Planning tasks...</p>
+            <div className="bg-white rounded-xl border border-gray-100 p-12 text-center">
+              <Loader2 className="w-6 h-6 text-gray-400 animate-spin mx-auto mb-4" />
+              <p className="text-gray-500">Planning tasks...</p>
             </div>
           )}
         </div>
